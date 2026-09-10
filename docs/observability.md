@@ -33,7 +33,7 @@ Use `--from` and `--to` for an explicit interval, or `--stdin` for JSONL supplie
 
 The report includes coverage, request counts, status/origin counts, route/status counts, bounded error categories, transport outcomes, semantic stream outcomes, attempts, fallbacks, incomplete request pairs, dropped events, and p50/p95/p99 latency metrics.
 
-Accepted WebSocket upgrades (`101 Switching Protocols`) that are still open are reported as `active_upgrades`; they are not counted as unfinished requests and do not trigger an incomplete-coverage warning by themselves.
+Accepted WebSocket upgrades (`101 Switching Protocols`) that are still open are reported as `active_upgrades`; they are not counted as unfinished requests and do not trigger an incomplete-coverage warning by themselves. If a later `startup` event proves the process restarted before an upgrade emitted its closing event, it is reported as `interrupted_upgrades` and does trigger a coverage warning instead of being mistaken for a live connection.
 
 Small samples and genuinely incomplete coverage are explicitly warned about and should not be used alone to declare an optimization successful.
 

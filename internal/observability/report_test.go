@@ -76,3 +76,27 @@ func TestReportCountsClosedWebSocketAsCompletedNotActive(t *testing.T) {
 		t.Fatalf("active=%d unfinished=%d outcomes=%v", report.ActiveUpgrades(), report.Unfinished(), report.Outcomes)
 	}
 }
+
+func TestReportMarksUpgradeInterruptedByLaterStartup(t *testing.T) {
+	base := time.Date(2026, 9, 10, 15, 0, 0, 0, time.UTC)
+	input := strings.Join([]string{
+		`{"ts":"2026-09-10T15:00:01Z","schema_version":1,"event_type":"request_start","request_id":"r_ws","transport":"websocket"}`,
+		`{"ts":"2026-09-10T15:00:02Z","schema_version":1,"event_type":"upstream_attempt","request_id":"r_ws","transport":"websocket","status_code":101,"status_origin":"upstream","attempt":1}`,
+		`{"ts":"2026-09-10T15:01:00Z","schema_version":1,"event_type":"startup","service_version":"docker","service_commit":"new"}`,
+	}, "\n")
+	report := NewReport(ReportOptions{Start: base, End: base.Add(time.Hour), Location: time.UTC})
+	if err := report.AddReader(strings.NewReader(input)); err != nil {
+		t.Fatal(err)
+	}
+	if report.ActiveUpgrades() != 0 || report.InterruptedUpgrades() != 1 || report.Unfinished() != 0 {
+		t.Fatalf("active=%d interrupted=%d unfinished=%d", report.ActiveUpgrades(), report.InterruptedUpgrades(), report.Unfinished())
+	}
+	var out bytes.Buffer
+	report.WriteText(&out)
+	text := out.String()
+	for _, want := range []string{"active_upgrades=0", "interrupted_upgrades=1", "Coverage warning"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("report missing %q:\n%s", want, text)
+		}
+	}
+}
