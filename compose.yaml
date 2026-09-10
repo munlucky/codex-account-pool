@@ -1,0 +1,24 @@
+services:
+  gpt-codex-router:
+    build:
+      context: .
+      args:
+        VERSION: docker
+    image: gpt-codex-router:local
+    container_name: gpt-codex-router
+    restart: unless-stopped
+    environment:
+      GPT_CODEX_ROUTER_HOME: /data
+      GPT_CODEX_ROUTER_CONTAINER: "1"
+    volumes:
+      - type: bind
+        source: ${APPDATA}/GPTCodexRouter
+        target: /data
+    ports:
+      - "127.0.0.1:8317:8317"
+    command: ["serve", "--listen", "0.0.0.0:8317"]
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s

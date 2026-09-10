@@ -1,0 +1,37 @@
+/dist/
+
+# GPTCodexRouter runtime state. Codex-owned auth files may live below this
+# directory when GPT_CODEX_ROUTER_HOME is intentionally pointed into a checkout.
+/.gpt-codex-router/
+/registry.json
+/profiles/
+
+# Legacy/local configuration and credential material
+/config.json
+/config.*.json
+/accounts/
+/tokens/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Keys / certificates / credential exports
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+credentials.json
+credentials.*.json
+secrets.json
+secrets.*.json
+
+# Logs / local OS / editor state
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

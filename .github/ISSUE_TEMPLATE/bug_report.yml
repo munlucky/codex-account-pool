@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible GPT Codex Router problem
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste auth.json, access tokens, refresh tokens, cookies, or ChatGPT account IDs.
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: commit SHA or release
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows version, Docker Desktop version, Codex version.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Redact all credential-bearing data before posting logs.
+    validations:
+      required: true
