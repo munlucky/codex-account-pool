@@ -34,3 +34,45 @@ func TestReportSeparatesHTTPStatusFromStreamOutcomeAndCoverage(t *testing.T) {
 		}
 	}
 }
+
+func TestReportTreatsAcceptedWebSocketAsActiveUpgradeNotUnfinished(t *testing.T) {
+	base := time.Date(2026, 9, 10, 15, 0, 0, 0, time.UTC)
+	input := strings.Join([]string{
+		`{"ts":"2026-09-10T15:00:01Z","schema_version":1,"event_type":"request_start","request_id":"r_ws","method":"GET","route_template":"/backend-api/wham/*","transport":"websocket"}`,
+		`{"ts":"2026-09-10T15:00:02Z","schema_version":1,"event_type":"upstream_attempt","request_id":"r_ws","method":"GET","route_template":"/backend-api/wham/*","transport":"websocket","status_code":101,"status_origin":"upstream","attempt":1,"upstream_headers_ms":25}`,
+	}, "\n")
+	report := NewReport(ReportOptions{Start: base, End: base.Add(time.Hour), Location: time.UTC})
+	if err := report.AddReader(strings.NewReader(input)); err != nil {
+		t.Fatal(err)
+	}
+	if report.ActiveUpgrades() != 1 || report.Unfinished() != 0 {
+		t.Fatalf("active_upgrades=%d unfinished=%d", report.ActiveUpgrades(), report.Unfinished())
+	}
+	var out bytes.Buffer
+	report.WriteText(&out)
+	text := out.String()
+	for _, want := range []string{"active_upgrades=1", "unfinished=0"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("report missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "Coverage warning") {
+		t.Fatalf("active websocket must not mark coverage incomplete:\n%s", text)
+	}
+}
+
+func TestReportCountsClosedWebSocketAsCompletedNotActive(t *testing.T) {
+	base := time.Date(2026, 9, 10, 15, 0, 0, 0, time.UTC)
+	input := strings.Join([]string{
+		`{"ts":"2026-09-10T15:00:01Z","schema_version":1,"event_type":"request_start","request_id":"r_ws","transport":"websocket"}`,
+		`{"ts":"2026-09-10T15:00:02Z","schema_version":1,"event_type":"upstream_attempt","request_id":"r_ws","transport":"websocket","status_code":101,"status_origin":"upstream","attempt":1}`,
+		`{"ts":"2026-09-10T15:00:03Z","schema_version":1,"event_type":"request_end","request_id":"r_ws","route_template":"/backend-api/wham/*","transport":"websocket","status_code":101,"status_origin":"upstream","outcome":"upgrade_closed"}`,
+	}, "\n")
+	report := NewReport(ReportOptions{Start: base, End: base.Add(time.Hour), Location: time.UTC})
+	if err := report.AddReader(strings.NewReader(input)); err != nil {
+		t.Fatal(err)
+	}
+	if report.ActiveUpgrades() != 0 || report.Unfinished() != 0 || report.Outcomes[OutcomeUpgradeClosed] != 1 {
+		t.Fatalf("active=%d unfinished=%d outcomes=%v", report.ActiveUpgrades(), report.Unfinished(), report.Outcomes)
+	}
+}

@@ -28,6 +28,7 @@ type Report struct {
 	SchemaMismatch     int
 	Starts             map[string]Event
 	Ends               map[string]Event
+	UpgradeAccepted    map[string]Event
 	EndEvents          []Event
 	StatusCounts       map[int]int
 	RouteStatuses      map[string]map[int]int
@@ -49,7 +50,7 @@ func NewReport(opts ReportOptions) *Report {
 	}
 	return &Report{
 		Start: opts.Start, End: opts.End, Location: loc,
-		Starts: map[string]Event{}, Ends: map[string]Event{}, StatusCounts: map[int]int{},
+		Starts: map[string]Event{}, Ends: map[string]Event{}, UpgradeAccepted: map[string]Event{}, StatusCounts: map[int]int{},
 		RouteStatuses: map[string]map[int]int{}, ErrorCategories: map[string]int{}, Outcomes: map[string]int{},
 		SemanticOutcomes: map[string]int{}, StatusOrigins: map[string]int{}, Latencies: map[string][]float64{},
 		GroupLatencies: map[string]map[string][]float64{},
@@ -121,6 +122,9 @@ func (r *Report) AddReader(reader io.Reader) error {
 		case EventUpstreamAttempt:
 			r.Attempts++
 			r.addLatency("upstream_headers_ms", event.UpstreamHeadersMS)
+			if event.RequestID != "" && event.StatusCode == 101 && event.Transport == "websocket" {
+				r.UpgradeAccepted[event.RequestID] = event
+			}
 		case EventTransportFallback:
 			r.TransportFallbacks++
 		case EventLoggerHealth:
@@ -136,12 +140,26 @@ func (r *Report) addLatency(name string, value float64) {
 	}
 }
 
+func (r *Report) ActiveUpgrades() int {
+	count := 0
+	for id := range r.UpgradeAccepted {
+		if _, ended := r.Ends[id]; !ended {
+			count++
+		}
+	}
+	return count
+}
+
 func (r *Report) Unfinished() int {
 	count := 0
 	for id := range r.Starts {
-		if _, ok := r.Ends[id]; !ok {
-			count++
+		if _, ended := r.Ends[id]; ended {
+			continue
 		}
+		if _, activeUpgrade := r.UpgradeAccepted[id]; activeUpgrade {
+			continue
+		}
+		count++
 	}
 	return count
 }
@@ -159,12 +177,12 @@ func (r *Report) EndsWithoutStart() int {
 func (r *Report) WriteText(w io.Writer) {
 	fmt.Fprintf(w, "GPT Codex Router observability report\n")
 	fmt.Fprintf(w, "Window: %s -> %s (%s)\n", r.Start.In(r.Location).Format(time.RFC3339), r.End.In(r.Location).Format(time.RFC3339), r.Location)
-	fmt.Fprintf(w, "Coverage: lines=%d events=%d starts=%d ends=%d unfinished=%d end_without_start=%d malformed=%d schema_mismatch=%d dropped_events=%d\n",
-		r.Lines, r.Events, len(r.Starts), len(r.EndEvents), r.Unfinished(), r.EndsWithoutStart(), r.Malformed, r.SchemaMismatch, r.DroppedEvents)
+	fmt.Fprintf(w, "Coverage: lines=%d events=%d starts=%d ends=%d active_upgrades=%d unfinished=%d end_without_start=%d malformed=%d schema_mismatch=%d dropped_events=%d\n",
+		r.Lines, r.Events, len(r.Starts), len(r.EndEvents), r.ActiveUpgrades(), r.Unfinished(), r.EndsWithoutStart(), r.Malformed, r.SchemaMismatch, r.DroppedEvents)
 	if r.DroppedEvents > 0 || r.Malformed > 0 || r.SchemaMismatch > 0 || r.Unfinished() > 0 {
 		fmt.Fprintln(w, "Coverage warning: this interval is incomplete; do not use it alone to declare the service healthy or an optimization successful.")
 	}
-	fmt.Fprintf(w, "Requests: completed=%d upstream_attempts=%d transport_fallbacks=%d\n", len(r.EndEvents), r.Attempts, r.TransportFallbacks)
+	fmt.Fprintf(w, "Requests: completed=%d active_upgrades=%d upstream_attempts=%d transport_fallbacks=%d\n", len(r.EndEvents), r.ActiveUpgrades(), r.Attempts, r.TransportFallbacks)
 	writeIntMap(w, "Status", r.StatusCounts)
 	writeStringMap(w, "Status origin", r.StatusOrigins)
 	writeStringMap(w, "Error category", r.ErrorCategories)

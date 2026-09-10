@@ -8,11 +8,27 @@ COPY go.mod ./
 RUN go mod download
 COPY . .
 
-RUN CGO_ENABLED=0 go build \
-    -trimpath \
-    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
-    -o /out/gpt-codex-router \
-    ./cmd/gpt-codex-router
+RUN resolved_commit="${COMMIT}"; \
+    if [ -z "${resolved_commit}" ] || [ "${resolved_commit}" = "unknown" ]; then \
+      head_value="$(cat .git/HEAD 2>/dev/null || true)"; \
+      case "${head_value}" in \
+        "ref: "*) \
+          ref="${head_value#ref: }"; \
+          if [ -f ".git/${ref}" ]; then \
+            resolved_commit="$(cat ".git/${ref}")"; \
+          elif [ -f .git/packed-refs ]; then \
+            resolved_commit="$(awk -v ref="${ref}" '$2 == ref { print $1; exit }' .git/packed-refs)"; \
+          fi \
+          ;; \
+        ?*) resolved_commit="${head_value}" ;; \
+      esac; \
+    fi; \
+    if [ -z "${resolved_commit}" ]; then resolved_commit="unknown"; fi; \
+    CGO_ENABLED=0 go build \
+      -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${resolved_commit}" \
+      -o /out/gpt-codex-router \
+      ./cmd/gpt-codex-router
 
 FROM alpine:3.22
 

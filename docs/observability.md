@@ -21,7 +21,7 @@ Runtime data is written below the configured state root:
 
 The logger uses a bounded asynchronous queue. Queue overflow is surfaced later with `logger_health` and `dropped_events`; reports containing dropped events are incomplete evidence.
 
-Docker Compose also limits stdout JSON logs to 20 MiB x five files.
+Docker Compose also limits stdout JSON logs to 20 MiB x five files. Docker builds resolve the current Git HEAD from minimal repository metadata included in the build context, so `service_commit` identifies the source revision even when `docker compose up --build` is run directly. An explicit `COMMIT` build arg still overrides this resolution when needed.
 
 ## Reports
 
@@ -33,7 +33,9 @@ Use `--from` and `--to` for an explicit interval, or `--stdin` for JSONL supplie
 
 The report includes coverage, request counts, status/origin counts, route/status counts, bounded error categories, transport outcomes, semantic stream outcomes, attempts, fallbacks, incomplete request pairs, dropped events, and p50/p95/p99 latency metrics.
 
-Small samples and incomplete coverage are explicitly warned about and should not be used alone to declare an optimization successful.
+Accepted WebSocket upgrades (`101 Switching Protocols`) that are still open are reported as `active_upgrades`; they are not counted as unfinished requests and do not trigger an incomplete-coverage warning by themselves.
+
+Small samples and genuinely incomplete coverage are explicitly warned about and should not be used alone to declare an optimization successful.
 
 ## Baseline and rollback
 
