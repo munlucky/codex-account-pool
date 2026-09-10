@@ -1,6 +1,7 @@
 GO ?= $(shell if command -v go >/dev/null 2>&1; then command -v go; elif [ -x /usr/local/go/bin/go ]; then printf '%s' /usr/local/go/bin/go; elif [ -x /opt/homebrew/bin/go ]; then printf '%s' /opt/homebrew/bin/go; elif [ -x /tmp/go/bin/go ]; then printf '%s' /tmp/go/bin/go; else printf '%s' go; fi)
 VERSION ?= dev
-LDFLAGS := -s -w -X main.version=$(VERSION)
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || printf unknown)
+LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 DIST := dist
 PKG := ./cmd/gpt-codex-router
 
@@ -27,7 +28,7 @@ build-all: test vet
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -ldflags="$(LDFLAGS)" -o $(DIST)/gpt-codex-router-windows-amd64.exe $(PKG)
 
 docker-build:
-	docker build --build-arg VERSION=$(VERSION) -t gpt-codex-router:local .
+	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) -t gpt-codex-router:local .
 
 docker-up:
 	docker compose up -d --build

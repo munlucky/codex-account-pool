@@ -318,3 +318,13 @@ Bug reports and focused pull requests are welcome. Keep the project small, local
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Observability
+
+The router emits structured lifecycle events and distinguishes HTTP status from actual stream completion. Generate a recent report with:
+
+```bash
+gpt-codex-router report --since 3h --timezone Asia/Seoul
+```
+
+See [`docs/observability.md`](docs/observability.md) for the event contract, retention policy, coverage warnings, baseline rules, and rollback procedure.

@@ -13,6 +13,7 @@ import (
 )
 
 var version = "dev"
+var commit = "unknown"
 
 func main() {
 	root, err := profile.DefaultRoot()
@@ -27,6 +28,7 @@ func main() {
 		os.Stderr,
 		version,
 	)
+	application.Commit = commit
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if err := application.Execute(ctx, os.Args[1:]); err != nil {

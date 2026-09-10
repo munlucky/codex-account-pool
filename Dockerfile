@@ -2,6 +2,7 @@ FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 ARG VERSION=dev
+ARG COMMIT=unknown
 
 COPY go.mod ./
 RUN go mod download
@@ -9,7 +10,7 @@ COPY . .
 
 RUN CGO_ENABLED=0 go build \
     -trimpath \
-    -ldflags="-s -w -X main.version=${VERSION}" \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
     -o /out/gpt-codex-router \
     ./cmd/gpt-codex-router
 

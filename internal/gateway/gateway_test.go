@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/munlucky/codex-account-pool/internal/authbroker"
+	"github.com/munlucky/codex-account-pool/internal/observability"
 )
 
 type staticProvider struct {
@@ -211,8 +212,17 @@ func TestResponsesWebsocketForcesHTTPFallbackWithoutCallingUpstream(t *testing.T
 	if called {
 		t.Fatal("Responses websocket fallback must not call upstream")
 	}
-	if len(events) != 1 || !events[0].TransportFallback || events[0].StatusCode != http.StatusUpgradeRequired {
+	if len(events) != 3 {
 		t.Fatalf("events=%+v", events)
+	}
+	if events[0].EventType != observability.EventRequestStart || events[1].EventType != observability.EventTransportFallback || events[2].EventType != observability.EventRequestEnd {
+		t.Fatalf("event types=%q,%q,%q", events[0].EventType, events[1].EventType, events[2].EventType)
+	}
+	if !events[1].TransportFallback || events[1].StatusCode != http.StatusUpgradeRequired || events[2].StatusCode != http.StatusUpgradeRequired || events[2].Outcome != observability.OutcomeLocalResponse {
+		t.Fatalf("events=%+v", events)
+	}
+	if events[0].RequestID == "" || events[0].RequestID != events[1].RequestID || events[1].RequestID != events[2].RequestID {
+		t.Fatalf("request correlation missing: %+v", events)
 	}
 }
 
@@ -233,21 +243,15 @@ func TestProxyDoesNotCallUpstreamWhenBrokerFails(t *testing.T) {
 	}
 }
 
-func TestRequestLoggerEmitsCompactProfileStatus(t *testing.T) {
+func TestRequestLoggerEmitsStructuredLifecycle(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "ok")
 	}))
 	defer upstream.Close()
 
-	u, err := url.Parse(upstream.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h, err := New(staticProvider{creds: authbroker.Credentials{ProfileID: "account-2", AccessToken: "token", AccountID: "account"}}, u)
-	if err != nil {
-		t.Fatal(err)
-	}
-	events := make(chan RequestEvent, 1)
+	h := mustHandler(t, staticProvider{creds: authbroker.Credentials{ProfileID: "account-2", AccessToken: "token", AccountID: "account"}}, upstream.URL)
+	events := make(chan RequestEvent, 3)
 	h.SetRequestLogger(func(event RequestEvent) { events <- event })
 	proxy := httptest.NewServer(h)
 	defer proxy.Close()
@@ -256,15 +260,31 @@ func TestRequestLoggerEmitsCompactProfileStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	select {
-	case event := <-events:
-		if event.Method != http.MethodPost || event.ProfileID != "account-2" || event.StatusCode != http.StatusCreated {
-			t.Fatalf("event=%+v", event)
+	got := make([]RequestEvent, 0, 3)
+	deadline := time.After(time.Second)
+	for len(got) < 3 {
+		select {
+		case event := <-events:
+			got = append(got, event)
+		case <-deadline:
+			t.Fatalf("timed out waiting for lifecycle events: %+v", got)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("request logger did not emit")
+	}
+	startEvent, attemptEvent, endEvent := got[0], got[1], got[2]
+	if startEvent.EventType != observability.EventRequestStart || attemptEvent.EventType != observability.EventUpstreamAttempt || endEvent.EventType != observability.EventRequestEnd {
+		t.Fatalf("got=%+v", got)
+	}
+	if endEvent.Method != http.MethodPost || endEvent.StatusCode != http.StatusCreated || endEvent.StatusOrigin != "upstream" || endEvent.Outcome != observability.OutcomeBodyEOF {
+		t.Fatalf("end event=%+v", endEvent)
+	}
+	if endEvent.ProfileRef == "" || strings.Contains(endEvent.ProfileRef, "account-2") || endEvent.ResponseBytes != 2 || endEvent.FirstBodyMS <= 0 {
+		t.Fatalf("unsafe or incomplete end event=%+v", endEvent)
+	}
+	if startEvent.RequestID == "" || startEvent.RequestID != attemptEvent.RequestID || attemptEvent.RequestID != endEvent.RequestID {
+		t.Fatalf("request correlation missing: %+v", got)
 	}
 }
 
@@ -317,7 +337,7 @@ func TestUsageLimitAutomaticallySwitchesAndReplaysRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events := make(chan RequestEvent, 4)
+	events := make(chan RequestEvent, 8)
 	h.SetRequestLogger(func(event RequestEvent) { events <- event })
 	proxy := httptest.NewServer(h)
 	defer proxy.Close()
@@ -339,13 +359,36 @@ func TestUsageLimitAutomaticallySwitchesAndReplaysRequest(t *testing.T) {
 		t.Fatalf("request was not replayed exactly: %#v", bodies)
 	}
 
-	first := <-events
-	second := <-events
-	if first.SwitchFrom != "account-1" || first.SwitchTo != "account-2" {
-		t.Fatalf("switch event=%+v", first)
+	var got []RequestEvent
+	deadline := time.After(time.Second)
+	for len(got) < 5 {
+		select {
+		case event := <-events:
+			got = append(got, event)
+		case <-deadline:
+			t.Fatalf("timed out waiting for failover lifecycle: %+v", got)
+		}
 	}
-	if second.ProfileID != "account-2" || second.StatusCode != http.StatusOK {
-		t.Fatalf("final event=%+v", second)
+	var switchEvent, endEvent *RequestEvent
+	attempts := 0
+	for i := range got {
+		switch got[i].EventType {
+		case observability.EventUpstreamAttempt:
+			attempts++
+		case observability.EventAccountSwitch:
+			switchEvent = &got[i]
+		case observability.EventRequestEnd:
+			endEvent = &got[i]
+		}
+	}
+	if attempts != 2 || switchEvent == nil || switchEvent.SwitchFromRef == "" || switchEvent.SwitchToRef == "" || switchEvent.SwitchFromRef == switchEvent.SwitchToRef {
+		t.Fatalf("failover events=%+v", got)
+	}
+	if strings.Contains(switchEvent.SwitchFromRef, "account-1") || strings.Contains(switchEvent.SwitchToRef, "account-2") {
+		t.Fatalf("raw profile identifiers leaked: %+v", switchEvent)
+	}
+	if endEvent == nil || endEvent.StatusCode != http.StatusOK || endEvent.ProfileRef != switchEvent.SwitchToRef {
+		t.Fatalf("final event=%+v all=%+v", endEvent, got)
 	}
 }
 
@@ -393,4 +436,42 @@ func mustHandler(t *testing.T, provider CredentialProvider, upstream string) *Ha
 		t.Fatal(err)
 	}
 	return h
+}
+
+func TestSSESemanticCompletionIsObservedSeparatelyFromHTTPStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := mustHandler(t, staticProvider{creds: authbroker.Credentials{ProfileID: "account-1", AccessToken: "token", AccountID: "account"}}, upstream.URL)
+	events := make(chan RequestEvent, 3)
+	h.SetRequestLogger(func(event RequestEvent) { events <- event })
+	proxy := httptest.NewServer(h)
+	defer proxy.Close()
+
+	resp, err := http.Get(proxy.URL + "/backend-api/codex/responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case event := <-events:
+			if event.EventType != observability.EventRequestEnd {
+				continue
+			}
+			if event.StatusCode != http.StatusOK || event.Outcome != observability.OutcomeBodyEOF || event.SemanticOutcome != observability.SemanticCompleted {
+				t.Fatalf("end event=%+v", event)
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for request_end")
+		}
+	}
 }

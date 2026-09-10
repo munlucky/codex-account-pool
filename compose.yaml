@@ -22,3 +22,8 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

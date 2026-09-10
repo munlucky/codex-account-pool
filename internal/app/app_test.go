@@ -245,3 +245,17 @@ func TestCodexAuthPathIsNotDesktopStatePath(t *testing.T) {
 		t.Fatalf("auth path=%q want=%q", got, want)
 	}
 }
+
+func TestReportCommandReadsStructuredEventsFromStdin(t *testing.T) {
+	a, _, out := newTestApp(t)
+	a.In = strings.NewReader("{\"ts\":\"2026-09-11T00:00:01Z\",\"schema_version\":1,\"event_type\":\"request_start\",\"request_id\":\"r1\"}\n{\"ts\":\"2026-09-11T00:00:02Z\",\"schema_version\":1,\"event_type\":\"request_end\",\"request_id\":\"r1\",\"route_template\":\"/backend-api/codex/responses\",\"transport\":\"http\",\"status_code\":200,\"status_origin\":\"upstream\",\"outcome\":\"body_eof\",\"semantic_outcome\":\"completed\",\"gateway_total_ms\":100,\"first_body_ms\":20}\n")
+	if err := a.Execute(context.Background(), []string{"report", "--stdin", "--from", "2026-09-11T00:00:00Z", "--to", "2026-09-11T00:01:00Z", "--timezone", "Asia/Seoul"}); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{"Status: 200=1", "body_eof=1", "completed=1", "first_body_ms"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("report missing %q:\n%s", want, text)
+		}
+	}
+}

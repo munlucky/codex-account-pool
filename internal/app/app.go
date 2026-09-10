@@ -16,6 +16,7 @@ import (
 
 	"github.com/munlucky/codex-account-pool/internal/authbroker"
 	"github.com/munlucky/codex-account-pool/internal/gateway"
+	"github.com/munlucky/codex-account-pool/internal/observability"
 	"github.com/munlucky/codex-account-pool/internal/process"
 	"github.com/munlucky/codex-account-pool/internal/profile"
 )
@@ -27,10 +28,12 @@ const defaultListenAddress = "127.0.0.1:8317"
 type App struct {
 	Store    *profile.Store
 	Executor process.Executor
+	In       io.Reader
 	Out      io.Writer
 	Err      io.Writer
 	CodexBin string
 	Version  string
+	Commit   string
 }
 
 func New(store *profile.Store, executor process.Executor, out, errOut io.Writer, version string) *App {
@@ -39,8 +42,8 @@ func New(store *profile.Store, executor process.Executor, out, errOut io.Writer,
 		codexBin = "codex"
 	}
 	return &App{
-		Store: store, Executor: executor, Out: out, Err: errOut,
-		CodexBin: codexBin, Version: version,
+		Store: store, Executor: executor, In: os.Stdin, Out: out, Err: errOut,
+		CodexBin: codexBin, Version: version, Commit: "unknown",
 	}
 }
 
@@ -59,6 +62,8 @@ func (a *App) Execute(ctx context.Context, args []string) error {
 		return a.executeRun(ctx, args[1:])
 	case "serve":
 		return a.executeServe(ctx, args[1:])
+	case "report":
+		return a.executeReport(args[1:])
 	case "help", "--help", "-h":
 		a.printUsage()
 		return nil
@@ -266,8 +271,7 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 		return err
 	}
 	broker := authbroker.New(a.Store)
-	activeID, err := broker.ValidateActive()
-	if err != nil {
+	if _, err := broker.ValidateActive(); err != nil {
 		return err
 	}
 	upstream, _ := url.Parse("https://chatgpt.com")
@@ -275,17 +279,17 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	handler.SetRequestLogger(func(event gateway.RequestEvent) {
-		if event.TransportFallback {
-			fmt.Fprintln(a.Out, "transport responses websocket -> http")
-			return
-		}
-		if event.SwitchTo != "" {
-			fmt.Fprintf(a.Out, "switch %s -> %s quota\n", event.SwitchFrom, event.SwitchTo)
-			return
-		}
-		fmt.Fprintf(a.Out, "proxy %s %s %d\n", event.ProfileID, event.Method, event.StatusCode)
+	logPath := filepath.Join(a.Store.Root(), "observability", "events.jsonl")
+	logger, err := observability.NewLogger(observability.LoggerConfig{
+		Out: a.Out, FilePath: logPath, DailyDir: filepath.Join(a.Store.Root(), "observability", "daily"),
+		ServiceVersion: a.Version, ServiceCommit: a.Commit,
 	})
+	if err != nil {
+		return fmt.Errorf("initialize observability: %w", err)
+	}
+	defer logger.Close()
+	handler.SetRequestLogger(logger.Emit)
+	logger.Emit(observability.Event{EventType: observability.EventStartup})
 	server := &http.Server{
 		Addr:              listen,
 		Handler:           serverHandler(handler),
@@ -294,7 +298,6 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		fmt.Fprintf(a.Out, "GPT Codex Router ChatGPT gateway listening on http://%s/backend-api (active codex profile: %s)\n", listen, activeID)
 		errCh <- server.ListenAndServe()
 	}()
 	select {
@@ -404,6 +407,7 @@ Usage:
   gpt-codex-router auth use codex <profile>
   gpt-codex-router auth status codex [profile]
   gpt-codex-router serve [--listen 127.0.0.1:8317]
+  gpt-codex-router report [--since 3h] [--timezone Asia/Seoul] [--file <jsonl>|--stdin]
   gpt-codex-router run codex [--profile <id>] [-- <client args...>]
   gpt-codex-router version
 
