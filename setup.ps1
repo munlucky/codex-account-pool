@@ -16,6 +16,7 @@ $stateRoot = Join-Path $env:APPDATA 'GPTCodexRouter'
 $registryPath = Join-Path $stateRoot 'registry.json'
 $codexConfigPath = Join-Path $env:USERPROFILE '.codex\config.toml'
 $profilePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+$composeEnvPath = Join-Path $repoRoot '.env'
 
 function Require-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
@@ -166,15 +167,21 @@ function Set-CodexDesktopConfig {
 }
 
 
+function Write-ComposeEnvironment {
+    $composePath = ($stateRoot -replace '\\', '/').Replace("'", "\'")
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($composeEnvPath, "GPT_CODEX_ROUTER_STATE_ROOT='$composePath'`n", $utf8NoBom)
+}
+
 function Stop-ExistingRouter {
     Push-Location $repoRoot
+    $previousPreference = $ErrorActionPreference
     try {
-        $previousPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         & docker compose stop gpt-codex-router *> $null
-        $ErrorActionPreference = $previousPreference
     }
     finally {
+        $ErrorActionPreference = $previousPreference
         Pop-Location
     }
 }
@@ -220,6 +227,7 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Docker Desktop is not running or its engine is unavailable.'
 }
 
+Write-ComposeEnvironment
 Stop-ExistingRouter
 
 $registryState = Read-ExistingRegistry

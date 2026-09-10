@@ -27,24 +27,34 @@ GPT Codex Router (Docker)
 chatgpt.com/backend-api
 ```
 
-## Quick start: Windows + Docker Desktop
+## Quick start: Windows or macOS + Docker Desktop
 
 ### Requirements
 
-- Windows 10/11
+- Windows 10/11 or macOS 12+
 - Docker Desktop with Docker Compose v2
 - Official `codex` CLI available in `PATH`
 - One or more ChatGPT accounts that can sign in through Codex
 
-No local Go installation is required for the normal Docker setup. If `codex` is not installed yet, use the current official Codex installer from PowerShell:
+No local Go installation is required for the normal Docker setup.
+
+Install Codex on Windows if needed:
 
 ```powershell
 irm https://chatgpt.com/codex/install.ps1 | iex
 ```
 
-See the [upstream Codex repository](https://github.com/openai/codex) for other installation methods.
+Install Codex on macOS if needed:
+
+```bash
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+```
+
+Homebrew is also supported upstream with `brew install --cask codex`. See the [upstream Codex repository](https://github.com/openai/codex) for current installation methods.
 
 ### 1. Clone and run setup
+
+Windows:
 
 ```powershell
 git clone https://github.com/munlucky/gpt-codex-router.git
@@ -52,7 +62,15 @@ cd gpt-codex-router
 .\setup.cmd
 ```
 
-The setup script assigns `account-1`, `account-2`, and so on automatically. You only repeat the official ChatGPT/Codex sign-in for each account you want to add:
+macOS:
+
+```bash
+git clone https://github.com/munlucky/gpt-codex-router.git
+cd gpt-codex-router
+./setup.sh
+```
+
+Both setup scripts assign `account-1`, `account-2`, and so on automatically. You only repeat the official ChatGPT/Codex sign-in for each account you want to add:
 
 ```text
 account-1 -> official `codex login` -> browser ChatGPT sign-in
@@ -65,13 +83,16 @@ account-2 -> official `codex login` -> browser ChatGPT sign-in
 When the final login is complete, setup automatically:
 
 1. writes the local profile registry;
-2. backs up and configures `%USERPROFILE%\.codex\config.toml`;
+2. writes the host-state path to the ignored local `.env` used by Compose;
 3. builds and starts the Docker container;
-4. checks `http://127.0.0.1:8317/healthz`.
+4. checks `http://127.0.0.1:8317/healthz`;
+5. backs up and configures `~/.codex/config.toml` (or `%USERPROFILE%\.codex\config.toml` on Windows).
 
 Then **fully restart Codex Desktop**.
 
-For custom names, or to re-authenticate a profile that already exists, pass profile names explicitly while still completing each browser login interactively:
+For custom names, or to re-authenticate an existing profile, pass profile names explicitly while still completing each browser login interactively.
+
+Windows:
 
 ```powershell
 .\setup.ps1 -Profiles personal,work,backup
@@ -79,15 +100,33 @@ For custom names, or to re-authenticate a profile that already exists, pass prof
 .\setup.ps1 -Profiles personal
 ```
 
-If you downloaded a ZIP instead of cloning, extract it and run `setup.cmd` from that folder.
+macOS:
 
-Rerun `setup.cmd` later to add more automatically named accounts. Existing profiles and the originally selected active profile are preserved. Use `setup.ps1 -Profiles <name>` when you specifically want to re-authenticate an existing named profile.
+```bash
+./setup.sh --profiles personal,work,backup
+# Later, re-authenticate only one existing profile:
+./setup.sh --profiles personal
+```
+
+If you downloaded a ZIP instead of cloning, extract it and run `setup.cmd` on Windows or `./setup.sh` on macOS from that folder. If the ZIP loses the executable bit on macOS, run `chmod +x setup.sh` once.
+
+Rerun the platform setup script later to add more automatically named accounts. Existing profiles and the originally selected active profile are preserved.
 
 ### 2. Verify
+
+Windows:
 
 ```powershell
 docker compose ps
 Invoke-WebRequest http://127.0.0.1:8317/healthz
+docker compose logs --tail=100 gpt-codex-router
+```
+
+macOS:
+
+```bash
+docker compose ps
+curl -fsS http://127.0.0.1:8317/healthz
 docker compose logs --tail=100 gpt-codex-router
 ```
 
@@ -112,36 +151,29 @@ Tokens, ChatGPT account IDs, prompt bodies, and provider error bodies are not lo
 
 ### Router state
 
-Windows host state lives at:
+Host state lives outside the repository:
 
 ```text
-%APPDATA%\GPTCodexRouter
+Windows: %APPDATA%\GPTCodexRouter
+macOS:   ~/Library/Application Support/GPTCodexRouter
 ```
 
-Each Codex login is isolated:
+Each Codex login is isolated below `profiles/codex/<profile>/auth.json`. Docker bind-mounts the platform state directory as `/data`; credentials are not copied into the image or Docker build context.
 
-```text
-%APPDATA%\GPTCodexRouter\profiles\codex\<profile>\auth.json
-```
-
-Docker bind-mounts that directory as `/data`; credentials are not copied into the image or Docker build context.
+The setup script writes only the selected host-state path to the ignored repository-local `.env` file so ordinary `docker compose ...` commands use the same mount later. The `.env` file does not contain ChatGPT tokens.
 
 ### Codex Desktop config
 
-`setup.ps1` manages these two top-level settings in `%USERPROFILE%\.codex\config.toml`:
+`setup.ps1` and `setup.sh` manage these two top-level settings in the normal Codex config (`%USERPROFILE%\.codex\config.toml` on Windows, `~/.codex/config.toml` on macOS):
 
 ```toml
 chatgpt_base_url = "http://127.0.0.1:8317/backend-api"
 openai_base_url = "http://127.0.0.1:8317/backend-api/codex"
 ```
 
-Before editing an existing config, setup writes:
+Before editing an existing config, setup creates a one-time backup next to it named `config.toml.gpt-codex-router.bak`.
 
-```text
-%USERPROFILE%\.codex\config.toml.gpt-codex-router.bak
-```
-
-Use `-SkipCodexConfig` if you want to manage those settings yourself.
+Use `-SkipCodexConfig` on Windows or `--skip-codex-config` on macOS if you want to manage those settings yourself.
 
 Both base URLs are required for quota-aware routing. `chatgpt_base_url` routes ChatGPT backend services through the gateway. `openai_base_url` also routes the built-in OpenAI provider's Responses endpoint through it, including existing threads that retain `model_provider = "openai"`.
 
@@ -181,31 +213,31 @@ This project does not bypass, combine, or extend a provider quota. It only selec
 
 Start or rebuild:
 
-```powershell
+```bash
 docker compose up -d --build
 ```
 
 Stop:
 
-```powershell
+```bash
 docker compose down
 ```
 
 Logs:
 
-```powershell
+```bash
 docker compose logs -f --tail=100 gpt-codex-router
 ```
 
 List profiles from the running container:
 
-```powershell
+```bash
 docker compose exec gpt-codex-router gpt-codex-router auth list
 ```
 
 Select a preferred profile:
 
-```powershell
+```bash
 docker compose exec gpt-codex-router gpt-codex-router auth use codex personal
 ```
 
@@ -217,17 +249,18 @@ To add or refresh ChatGPT logins, rerun the host setup script. The Docker image 
 
 Stop the router:
 
-```powershell
+```bash
 docker compose down
 ```
 
-To return Codex Desktop to the config that existed before the first setup run, restore:
+To return Codex Desktop to the config that existed before the first setup run, restore the adjacent `config.toml.gpt-codex-router.bak` file. If setup created a brand-new config and no backup exists, remove the two router base-URL lines manually.
+
+Delete the platform state directory only if you also want to remove the isolated local login profiles. Treat that directory as credential material:
 
 ```text
-%USERPROFILE%\.codex\config.toml.gpt-codex-router.bak
+Windows: %APPDATA%\GPTCodexRouter
+macOS:   ~/Library/Application Support/GPTCodexRouter
 ```
-
-Then remove `%APPDATA%\GPTCodexRouter` only if you also want to delete the isolated local login profiles. Treat that directory as credential material.
 
 ## Manual / developer build
 

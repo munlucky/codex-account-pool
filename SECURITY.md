@@ -14,10 +14,11 @@ The project is not designed to be exposed to a LAN, the public internet, or mult
 
 ## Credential ownership and storage
 
-`setup.ps1` invokes the official Codex login flow with a dedicated `CODEX_HOME` for each profile and `cli_auth_credentials_store="file"`. On Windows, profile state is kept under:
+The host setup script invokes the official Codex login flow with a dedicated `CODEX_HOME` for each profile and `cli_auth_credentials_store="file"`. Profile state is kept under the platform state directory:
 
 ```text
-%APPDATA%\GPTCodexRouter\profiles\codex\<profile>
+Windows: %APPDATA%\GPTCodexRouter\profiles\codex\<profile>
+macOS:   ~/Library/Application Support/GPTCodexRouter/profiles/codex/<profile>
 ```
 
 The router reads the selected profile's Codex `auth.json` only to authenticate ChatGPT backend requests and maintain that same profile's OAuth refresh lifecycle.
@@ -44,7 +45,7 @@ host:      127.0.0.1:8317
 
 Additional container controls:
 
-- `%APPDATA%\GPTCodexRouter` is bind-mounted at `/data`; credential files are never copied into the image or build context;
+- the platform state directory is bind-mounted at `/data`; credential files are never copied into the image or build context;
 - the runtime process runs as a non-root user;
 - Linux capabilities are dropped;
 - `no-new-privileges` is enabled;
@@ -68,7 +69,7 @@ The broker refreshes an access token only when it is near expiration. Refresh be
 - refresh never causes profile failover;
 - successful updates are written atomically back to the same profile auth file.
 
-If a refresh grant is no longer usable, explicitly sign in to that profile again by rerunning `setup.ps1` (or using the native CLI workflow during development).
+If a refresh grant is no longer usable, explicitly sign in to that profile again by rerunning `setup.ps1` on Windows or `setup.sh` on macOS (or using the native CLI workflow during development).
 
 ## Profile selection and usage-limit failover
 
@@ -93,7 +94,7 @@ The router returns HTTP 426 only for the `/backend-api/codex/responses` WebSocke
 
 ## Child-process environment
 
-Native CLI login/status/run operations use an isolated `CODEX_HOME` and remove known API-key/token override variables before launching Codex. `setup.ps1` applies the same isolation when it invokes the official login command.
+Native CLI login/status/run operations use an isolated `CODEX_HOME` and remove known API-key/token override variables before launching Codex. both platform setup scripts apply the same isolation when invoking the official login command.
 
 ## Testing and repository hygiene
 

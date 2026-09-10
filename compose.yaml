@@ -12,7 +12,7 @@ services:
       GPT_CODEX_ROUTER_CONTAINER: "1"
     volumes:
       - type: bind
-        source: ${APPDATA}/GPTCodexRouter
+        source: ${GPT_CODEX_ROUTER_STATE_ROOT:?run setup.cmd on Windows or ./setup.sh on macOS first}
         target: /data
     ports:
       - "127.0.0.1:8317:8317"
