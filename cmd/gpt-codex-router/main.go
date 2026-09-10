@@ -7,9 +7,9 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/munlucky/gpt-codex-router/internal/app"
-	processpkg "github.com/munlucky/gpt-codex-router/internal/process"
-	"github.com/munlucky/gpt-codex-router/internal/profile"
+	"github.com/munlucky/codex-account-pool/internal/app"
+	processpkg "github.com/munlucky/codex-account-pool/internal/process"
+	"github.com/munlucky/codex-account-pool/internal/profile"
 )
 
 var version = "dev"

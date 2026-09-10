@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	processpkg "github.com/munlucky/gpt-codex-router/internal/process"
-	"github.com/munlucky/gpt-codex-router/internal/profile"
+	processpkg "github.com/munlucky/codex-account-pool/internal/process"
+	"github.com/munlucky/codex-account-pool/internal/profile"
 )
 
 type fakeExecutor struct {

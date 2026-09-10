@@ -14,10 +14,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/munlucky/gpt-codex-router/internal/authbroker"
-	"github.com/munlucky/gpt-codex-router/internal/gateway"
-	"github.com/munlucky/gpt-codex-router/internal/process"
-	"github.com/munlucky/gpt-codex-router/internal/profile"
+	"github.com/munlucky/codex-account-pool/internal/authbroker"
+	"github.com/munlucky/codex-account-pool/internal/gateway"
+	"github.com/munlucky/codex-account-pool/internal/process"
+	"github.com/munlucky/codex-account-pool/internal/profile"
 )
 
 var ErrUsage = errors.New("invalid command usage")

@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/munlucky/gpt-codex-router/internal/profile"
+	"github.com/munlucky/codex-account-pool/internal/profile"
 )
 
 const (

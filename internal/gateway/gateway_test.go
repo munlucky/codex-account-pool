@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/munlucky/gpt-codex-router/internal/authbroker"
+	"github.com/munlucky/codex-account-pool/internal/authbroker"
 )
 
 type staticProvider struct {

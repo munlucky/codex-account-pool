@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/munlucky/gpt-codex-router/internal/authbroker"
+	"github.com/munlucky/codex-account-pool/internal/authbroker"
 )
 
 type CredentialProvider interface {

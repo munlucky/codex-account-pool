@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/munlucky/gpt-codex-router/internal/profile"
+	"github.com/munlucky/codex-account-pool/internal/profile"
 )
 
 func TestCredentialsFollowActiveProfileOnEveryRequest(t *testing.T) {

@@ -17,7 +17,7 @@ FROM alpine:3.22
 
 LABEL org.opencontainers.image.title="GPT Codex Router" \
       org.opencontainers.image.description="Local ChatGPT subscription profile router for Codex" \
-      org.opencontainers.image.source="https://github.com/munlucky/gpt-codex-router" \
+      org.opencontainers.image.source="https://github.com/munlucky/codex-account-pool" \
       org.opencontainers.image.licenses="MIT"
 
 RUN apk add --no-cache ca-certificates \

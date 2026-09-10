@@ -57,7 +57,7 @@ Homebrew is also supported upstream with `brew install --cask codex`. See the [u
 Windows:
 
 ```powershell
-git clone https://github.com/munlucky/gpt-codex-router.git
+git clone https://github.com/munlucky/codex-account-pool.git
 cd gpt-codex-router
 .\setup.cmd
 ```
@@ -65,7 +65,7 @@ cd gpt-codex-router
 macOS:
 
 ```bash
-git clone https://github.com/munlucky/gpt-codex-router.git
+git clone https://github.com/munlucky/codex-account-pool.git
 cd gpt-codex-router
 ./setup.sh
 ```
