@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/munlucky/codex-account-pool/internal/authbroker"
 	"github.com/munlucky/codex-account-pool/internal/observability"
 )
@@ -25,6 +28,21 @@ type staticProvider struct {
 
 func (p staticProvider) Credentials(context.Context) (authbroker.Credentials, error) {
 	return p.creds, p.err
+}
+
+type traceCapturingTransport struct {
+	base   http.RoundTripper
+	traces chan *requestTrace
+}
+
+func (t traceCapturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if trace := traceFromRequest(req); trace != nil {
+		select {
+		case t.traces <- trace:
+		default:
+		}
+	}
+	return t.base.RoundTrip(req)
 }
 
 func testWebSocketKey() string {
@@ -130,6 +148,150 @@ func TestProxyStreamsSSEWithoutBufferingUntilCompletion(t *testing.T) {
 		t.Fatal("proxy buffered first SSE event until upstream completion")
 	}
 	close(release)
+}
+
+func TestContextObservationPreservesRequestBytesAndCapturesStreamingUsage(t *testing.T) {
+	bodies := make(chan string, 2)
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		bodies <- string(body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls == 1 {
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ctx-1\",\"output\":[{\"text\":\"PRIVATE_RESPONSE_TEXT\"}],\"usage\":{\"input_tokens\":120,\"output_tokens\":8,\"total_tokens\":128,\"input_tokens_details\":{\"cached_tokens\":90},\"output_tokens_details\":{\"reasoning_tokens\":3}}}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ctx-2\",\"usage\":{\"input_tokens\":130,\"cached_input_tokens\":95,\"output_tokens\":9,\"total_tokens\":139}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := mustHandler(t, staticProvider{creds: authbroker.Credentials{ProfileID: "account-1", AccessToken: "token", AccountID: "account"}}, upstream.URL)
+	traces := make(chan *requestTrace, 2)
+	transport := h.proxy.Transport.(*quotaFailoverTransport)
+	transport.base = traceCapturingTransport{base: http.DefaultTransport, traces: traces}
+	proxy := httptest.NewServer(h)
+	defer proxy.Close()
+
+	firstPayload := "{\n  \"input\": [{\"type\":\"message\",\"role\":\"user\",\"content\":\"SUPER_SECRET_PROMPT_938482\"}],\n  \"metadata\": {\"preserve\": \"whitespace\"}\n}"
+	resp, err := http.Post(proxy.URL+"/backend-api/codex/responses", "application/json", strings.NewReader(firstPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	firstTrace := <-traces
+	if got := <-bodies; got != firstPayload {
+		t.Fatalf("upstream request bytes changed: got=%q want=%q", got, firstPayload)
+	}
+	requestMetrics, delta, responseMetrics := firstTrace.contextSnapshot()
+	if requestMetrics.RequestBytes != int64(len(firstPayload)) || requestMetrics.AnalysisStatus != "analyzed" {
+		t.Fatalf("request metrics=%+v", requestMetrics)
+	}
+	if delta.Available {
+		t.Fatalf("first request must not claim predecessor: %+v", delta)
+	}
+	if !responseMetrics.UsageAvailable || responseMetrics.InputTokens != 120 || responseMetrics.CachedInputTokens != 90 || responseMetrics.OutputTokens != 8 || responseMetrics.ReasoningTokens != 3 || responseMetrics.TotalTokens != 128 {
+		t.Fatalf("response metrics=%+v", responseMetrics)
+	}
+	if strings.Contains(fmt.Sprintf("%+v %+v %+v", requestMetrics, delta, responseMetrics), "SUPER_SECRET_PROMPT_938482") || strings.Contains(fmt.Sprintf("%+v", responseMetrics), "PRIVATE_RESPONSE_TEXT") {
+		t.Fatal("context metrics retained raw request or response content")
+	}
+
+	secondPayload := `{"previous_response_id":"resp-ctx-1","input":[{"type":"message","role":"user","content":"SUPER_SECRET_PROMPT_938482"}]}`
+	resp, err = http.Post(proxy.URL+"/backend-api/codex/responses", "application/json", strings.NewReader(secondPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	secondTrace := <-traces
+	if got := <-bodies; got != secondPayload {
+		t.Fatalf("second upstream request bytes changed: got=%q want=%q", got, secondPayload)
+	}
+	_, secondDelta, secondResponse := secondTrace.contextSnapshot()
+	if !secondDelta.Available || secondDelta.ReusedItemCount != 1 || secondDelta.ReusedContextBytes <= 0 {
+		t.Fatalf("previous_response_id lineage was not resolved: %+v", secondDelta)
+	}
+	if !secondResponse.UsageAvailable || secondResponse.InputTokens != 130 || secondResponse.CachedInputTokens != 95 {
+		t.Fatalf("second response metrics=%+v", secondResponse)
+	}
+}
+
+func TestContextObservationIsFailOpenForMalformedJSON(t *testing.T) {
+	bodySeen := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodySeen <- string(body)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	h := mustHandler(t, staticProvider{creds: authbroker.Credentials{AccessToken: "token", AccountID: "account"}}, upstream.URL)
+	traces := make(chan *requestTrace, 1)
+	transport := h.proxy.Transport.(*quotaFailoverTransport)
+	transport.base = traceCapturingTransport{base: http.DefaultTransport, traces: traces}
+	proxy := httptest.NewServer(h)
+	defer proxy.Close()
+
+	payload := `{"input":`
+	resp, err := http.Post(proxy.URL+"/backend-api/codex/responses", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || <-bodySeen != payload {
+		t.Fatalf("malformed JSON must still proxy unchanged: status=%d", resp.StatusCode)
+	}
+	requestMetrics, _, _ := (<-traces).contextSnapshot()
+	if requestMetrics.AnalysisStatus != "skipped" || requestMetrics.SkipReason != "malformed_json" || requestMetrics.RequestBytes != int64(len(payload)) {
+		t.Fatalf("unexpected fail-open metrics: %+v", requestMetrics)
+	}
+}
+
+func TestContextObservationProjectsSafeRequestEndEvent(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-event-safe\",\"output\":[{\"text\":\"PRIVATE_RESPONSE_TEXT\"}],\"usage\":{\"input_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":15},\"output_tokens\":4,\"total_tokens\":24}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := mustHandler(t, staticProvider{creds: authbroker.Credentials{AccessToken: "token", AccountID: "account"}}, upstream.URL)
+	events := make(chan RequestEvent, 4)
+	h.SetRequestLogger(func(event RequestEvent) { events <- event })
+	proxy := httptest.NewServer(h)
+	defer proxy.Close()
+
+	payload := `{"prompt_cache_key":"PRIVATE_CACHE_LINEAGE_KEY","instructions":"SUPER_SECRET_PROMPT_938482","metadata":{"private":"PRIVATE_METADATA"},"input":[{"type":"message","role":"developer","content":"PRIVATE_DEVELOPER"},{"type":"reasoning","encrypted_content":"PRIVATE_REASONING"},{"type":"function_call_output","output":"PRIVATE_TOOL_OUTPUT"}],"tools":[{"type":"function","name":"private_tool","description":"PRIVATE_TOOL_DEFINITION"}]}`
+	resp, err := http.Post(proxy.URL+"/backend-api/codex/responses", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case event := <-events:
+			if event.EventType != observability.EventRequestEnd {
+				continue
+			}
+			if event.ContextAnalysis != "analyzed" || event.LineageSource != "prompt_cache_key" || event.RequestBytes != int64(len(payload)) || event.ContextBytes != int64(len(payload)) || event.ToolItems != 1 || event.ToolDefinitionBytes <= 0 || event.DeveloperBytes <= 0 || event.ReasoningBytes <= 0 || event.MetadataBytes <= 0 || !event.UsageAvailable || event.InputTokens != 20 || event.CachedInputTokens != 15 || event.OutputTokens != 4 || event.TotalTokens != 24 {
+				t.Fatalf("context end event=%+v", event)
+			}
+			serialized := fmt.Sprintf("%+v", event)
+			for _, secret := range []string{"PRIVATE_CACHE_LINEAGE_KEY", "SUPER_SECRET_PROMPT_938482", "PRIVATE_METADATA", "PRIVATE_DEVELOPER", "PRIVATE_REASONING", "PRIVATE_TOOL_OUTPUT", "PRIVATE_TOOL_DEFINITION", "PRIVATE_RESPONSE_TEXT", "resp-event-safe"} {
+				if strings.Contains(serialized, secret) {
+					t.Fatalf("request_end event leaked %q: %s", secret, serialized)
+				}
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for context request_end")
+		}
+	}
 }
 
 func TestProxyPreservesUpgradeTunnel(t *testing.T) {
@@ -472,6 +634,140 @@ func TestSSESemanticCompletionIsObservedSeparatelyFromHTTPStatus(t *testing.T) {
 			return
 		case <-deadline:
 			t.Fatal("timed out waiting for request_end")
+		}
+	}
+}
+
+func TestZstdContextObservationPreservesWireBytesAcrossFailover(t *testing.T) {
+	provider := &failoverProvider{
+		current:  authbroker.Credentials{ProfileID: "account-1", AccessToken: "token-1", AccountID: "acct-1"},
+		fallback: authbroker.Credentials{ProfileID: "account-2", AccessToken: "token-2", AccountID: "acct-2"},
+	}
+	payload := []byte(`{"conversation_id":"conv-zstd","instructions":"SUPER_SECRET_ZSTD_INSTRUCTION","input":[{"type":"message","role":"user","content":"SUPER_SECRET_ZSTD_USER"}]}`)
+	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed := encoder.EncodeAll(payload, nil)
+	encoder.Close()
+
+	var bodies [][]byte
+	var encodings []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, append([]byte(nil), body...))
+		encodings = append(encodings, r.Header.Get("Content-Encoding"))
+		if r.Header.Get("ChatGPT-Account-ID") == "acct-1" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":{"type":"usage_limit_reached","resets_at":2000003600}}`)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	h := mustHandler(t, provider, upstream.URL)
+	traces := make(chan *requestTrace, 2)
+	transport := h.proxy.Transport.(*quotaFailoverTransport)
+	transport.base = traceCapturingTransport{base: http.DefaultTransport, traces: traces}
+	proxy := httptest.NewServer(h)
+	defer proxy.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, proxy.URL+"/backend-api/codex/responses", bytes.NewReader(compressed))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "zstd")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || provider.failoverCalls != 1 {
+		t.Fatalf("status=%d failovers=%d", resp.StatusCode, provider.failoverCalls)
+	}
+	if len(bodies) != 2 || !bytes.Equal(bodies[0], compressed) || !bytes.Equal(bodies[1], compressed) {
+		t.Fatalf("compressed request was not replayed byte-for-byte: lens=%v", []int{len(bodies[0]), len(bodies[1])})
+	}
+	if len(encodings) != 2 || encodings[0] != "zstd" || encodings[1] != "zstd" {
+		t.Fatalf("content encoding changed across replay: %v", encodings)
+	}
+
+	firstTrace := <-traces
+	metrics, _, _ := firstTrace.contextSnapshot()
+	if metrics.AnalysisStatus != "analyzed" || metrics.RequestBytes != int64(len(compressed)) || metrics.ContextBytes != int64(len(payload)) || metrics.UserItems != 1 {
+		t.Fatalf("zstd context metrics=%+v", metrics)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", metrics), "SUPER_SECRET_ZSTD") {
+		t.Fatalf("context metrics leaked decoded content: %+v", metrics)
+	}
+}
+
+func TestResponsesPostObservesAndStreamsSSEWithAlternateContentType(t *testing.T) {
+	firstFlushed := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"arguments\":\"ARG_MARKER_123\"}}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(firstFlushed)
+		<-release
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-alt-content-type\",\"usage\":{\"input_tokens\":321,\"input_tokens_details\":{\"cached_tokens\":222},\"output_tokens\":17,\"output_tokens_details\":{\"reasoning_tokens\":9},\"total_tokens\":338}}}\n\n")
+	}))
+	defer upstream.Close()
+
+	h := mustHandler(t, staticProvider{creds: authbroker.Credentials{ProfileID: "account-1", AccessToken: "token", AccountID: "account"}}, upstream.URL)
+	events := make(chan RequestEvent, 8)
+	h.SetRequestLogger(func(event RequestEvent) { events <- event })
+	proxy := httptest.NewServer(h)
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/backend-api/codex/responses", "application/json", strings.NewReader(`{"input":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	select {
+	case <-firstFlushed:
+	case <-time.After(time.Second):
+		t.Fatal("upstream did not flush first alternate-content-type SSE event")
+	}
+	reader := bufio.NewReader(resp.Body)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(line, "response.output_item.done") {
+		t.Fatalf("first streamed line=%q", line)
+	}
+	close(release)
+	_, _ = io.Copy(io.Discard, reader)
+
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case event := <-events:
+			if event.EventType != observability.EventRequestEnd {
+				continue
+			}
+			if event.SemanticOutcome != observability.SemanticCompleted || event.SSEEventCount != 2 || event.ToolCallCount != 1 {
+				t.Fatalf("stream observation event=%+v", event)
+			}
+			if !event.UsageAvailable || event.InputTokens != 321 || event.CachedInputTokens != 222 || event.OutputTokens != 17 || event.ReasoningTokens != 9 || event.TotalTokens != 338 {
+				t.Fatalf("usage observation event=%+v", event)
+			}
+			serialized := fmt.Sprintf("%+v", event)
+			if strings.Contains(serialized, "ARG_MARKER_123") || strings.Contains(serialized, "resp-alt-content-type") {
+				t.Fatalf("stream metadata leaked raw content: %+v", event)
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for alternate-content-type request_end")
 		}
 	}
 }

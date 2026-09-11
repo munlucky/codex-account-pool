@@ -321,10 +321,14 @@ MIT. See [LICENSE](LICENSE).
 
 ## Observability
 
-The router emits structured lifecycle events and distinguishes HTTP status from actual stream completion. Generate a recent report with:
+The router emits structured lifecycle events and distinguishes HTTP status from actual stream completion. For `/backend-api/codex/responses`, it also records **metadata-only Context Observability**: exact wire-body size, decoded context size, composition, bounded process-local opaque fingerprints, observed context reuse/growth, SSE event counts, and numeric token usage when ChatGPT supplies it. Codex may send the request body with `Content-Encoding: zstd`; the router decodes a bounded observer-only copy for analysis while forwarding and replaying the original compressed bytes unchanged. Prompt text, response text, source code, terminal/tool output contents, function arguments, and decoded payloads are not stored.
+
+Generate a recent report with:
 
 ```bash
 gpt-codex-router report --since 3h --timezone Asia/Seoul
 ```
 
-See [`docs/observability.md`](docs/observability.md) for the event contract, retention policy, coverage warnings, baseline rules, and rollback procedure.
+The report's `Context observability` section shows coverage, **request wire size**, **decoded context size**, context growth/reuse/amplification, structural composition, token usage, and replay inference. Stable lineage prefers explicit conversation/thread identifiers and can fall back to a process-local HMAC of `prompt_cache_key`; only the bounded lineage-source enum is logged, never the key itself. Composition separates tool outputs from tool definitions plus system, developer, reasoning, metadata, and residual other bytes. Growth/reuse/amplification are calculated from the decoded context representation rather than compressed wire bytes. `context_reuse_ratio` is structural payload reuse observed by the router; it is **not** the GPT prompt-cache hit rate. When upstream usage contains `cached_input_tokens`, the report shows the actual cached-token ratio separately. If upstream usage is absent, token usage is reported as `unavailable` rather than estimated from byte counts.
+
+See [`docs/observability.md`](docs/observability.md) for the event contract, Context metric definitions, retention policy, coverage warnings, baseline rules, and rollback procedure.

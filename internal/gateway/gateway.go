@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/munlucky/codex-account-pool/internal/authbroker"
+	"github.com/munlucky/codex-account-pool/internal/contextobs"
 	"github.com/munlucky/codex-account-pool/internal/observability"
 )
 
@@ -43,10 +44,13 @@ type RequestEvent = observability.Event
 type RequestLogger func(RequestEvent)
 
 type Handler struct {
-	provider   CredentialProvider
-	proxy      *httputil.ReverseProxy
-	logger     RequestLogger
-	profileKey []byte
+	provider        CredentialProvider
+	proxy           *httputil.ReverseProxy
+	logger          RequestLogger
+	profileKey      []byte
+	contextKey      []byte
+	contextAnalyzer *contextobs.Analyzer
+	contextTracker  *contextobs.Tracker
 }
 
 type quotaFailoverTransport struct {
@@ -77,6 +81,12 @@ type requestTrace struct {
 	responseBytes   int64
 	firstBodyMS     float64
 	semantic        *sseObserver
+
+	contextRequest  contextobs.RequestMetrics
+	contextDelta    contextobs.DeltaMetrics
+	contextResponse *contextobs.ResponseObserver
+	contextTracker  *contextobs.Tracker
+	contextBound    bool
 }
 
 type observedBody struct {
@@ -102,7 +112,19 @@ func New(provider CredentialProvider, upstream *url.URL) (*Handler, error) {
 	if _, err := rand.Read(profileKey); err != nil {
 		return nil, fmt.Errorf("initialize profile anonymizer: %w", err)
 	}
-	h := &Handler{provider: provider, profileKey: profileKey}
+	contextKey, err := contextobs.NewProcessSecret()
+	if err != nil {
+		return nil, err
+	}
+	contextAnalyzer, err := contextobs.NewAnalyzer(contextKey, 0)
+	if err != nil {
+		return nil, err
+	}
+	h := &Handler{
+		provider: provider, profileKey: profileKey,
+		contextKey: contextKey, contextAnalyzer: contextAnalyzer,
+		contextTracker: contextobs.NewTracker(contextobs.TrackerOptions{}),
+	}
 	transport := &quotaFailoverTransport{base: http.DefaultTransport, provider: provider, handler: h}
 	h.proxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -124,8 +146,10 @@ func New(provider CredentialProvider, upstream *url.URL) (*Handler, error) {
 			if resp.StatusCode >= 400 {
 				trace.setErrorCategory("upstream_http")
 			}
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type"))), "text/event-stream") {
-				trace.enableSSE()
+			isResponsesPost := trace.routeTemplate == "/backend-api/codex/responses" && trace.method == http.MethodPost
+			isEventStream := strings.HasPrefix(strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type"))), "text/event-stream")
+			if (isResponsesPost && resp.StatusCode != http.StatusSwitchingProtocols) || isEventStream {
+				trace.enableSSE(h.contextKey)
 			}
 			if resp.Body != nil && resp.StatusCode != http.StatusSwitchingProtocols {
 				resp.Body = &observedBody{ReadCloser: resp.Body, trace: trace}
@@ -211,6 +235,25 @@ func (h *Handler) emit(event observability.Event) {
 	}
 }
 
+func (h *Handler) observeRequestContext(req *http.Request, body []byte) {
+	if req == nil || req.Method != http.MethodPost || req.URL.Path != "/backend-api/codex/responses" || h.contextAnalyzer == nil {
+		return
+	}
+	// Context observation is strictly fail-open. Any analyzer defect must never
+	// affect the proxy data plane.
+	defer func() { _ = recover() }()
+	trace := traceFromRequest(req)
+	if trace == nil {
+		return
+	}
+	metrics := h.contextAnalyzer.AnalyzeRequestEncoded(body, req.Header.Get("Content-Encoding"))
+	delta := contextobs.DeltaMetrics{}
+	if h.contextTracker != nil && metrics.AnalysisStatus == contextobs.AnalysisAnalyzed {
+		delta = h.contextTracker.CompareAndStore(metrics)
+	}
+	trace.setContextRequest(metrics, delta, h.contextTracker)
+}
+
 func (h *Handler) profileRef(profileID string) string {
 	if profileID == "" {
 		return ""
@@ -270,6 +313,9 @@ func (t *quotaFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 	body, err := makeReplayable(req)
 	if err != nil {
 		return nil, err
+	}
+	if t.handler != nil {
+		t.handler.observeRequestContext(req, body)
 	}
 	attempted := map[string]bool{}
 	if creds, ok := requestCredentials(req); ok {
@@ -430,7 +476,7 @@ func (t *requestTrace) endEvent(ctxErr error, writerStatus int) observability.Ev
 	if t.semantic != nil {
 		semantic = t.semantic.Outcome()
 	}
-	return observability.Event{
+	event := observability.Event{
 		EventType: observability.EventRequestEnd,
 		RequestID: t.id, Method: t.method, RouteTemplate: t.routeTemplate,
 		Transport: t.transport, PeerClass: t.peerClass, ProfileRef: t.profileRef,
@@ -439,6 +485,53 @@ func (t *requestTrace) endEvent(ctxErr error, writerStatus int) observability.Ev
 		AuthMS: t.authMS, FirstBodyMS: t.firstBodyMS, ResponseBytes: t.responseBytes,
 		SemanticOutcome: semantic,
 	}
+	if t.contextRequest.AnalysisStatus != "" {
+		event.ContextAnalysis = t.contextRequest.AnalysisStatus
+		event.ContextSkipReason = t.contextRequest.SkipReason
+		event.LineageSource = t.contextRequest.LineageSource
+		event.BodyRef = t.contextRequest.BodyRef
+		event.RequestBytes = t.contextRequest.RequestBytes
+		event.ContextBytes = t.contextRequest.ContextBytes
+		event.InstructionsBytes = t.contextRequest.InstructionsBytes
+		event.UserBytes = t.contextRequest.UserBytes
+		event.AssistantBytes = t.contextRequest.AssistantBytes
+		event.ToolOutputBytes = t.contextRequest.ToolOutputBytes
+		event.ToolDefinitionBytes = t.contextRequest.ToolDefinitionBytes
+		event.SystemBytes = t.contextRequest.SystemBytes
+		event.DeveloperBytes = t.contextRequest.DeveloperBytes
+		event.ReasoningBytes = t.contextRequest.ReasoningBytes
+		event.MetadataBytes = t.contextRequest.MetadataBytes
+		event.OtherInputBytes = t.contextRequest.OtherInputBytes
+		event.InputItems = t.contextRequest.InputItems
+		event.UserItems = t.contextRequest.UserItems
+		event.AssistantItems = t.contextRequest.AssistantItems
+		event.ToolItems = t.contextRequest.ToolItems
+	}
+	if t.contextDelta.Available {
+		event.ContextDeltaAvailable = true
+		event.PreviousRequestBytes = t.contextDelta.PreviousRequestBytes
+		event.PreviousContextBytes = t.contextDelta.PreviousContextBytes
+		event.ContextGrowthBytes = t.contextDelta.ContextGrowthBytes
+		event.ReusedItemCount = t.contextDelta.ReusedItemCount
+		event.ReusedContextBytes = t.contextDelta.ReusedContextBytes
+		event.NovelContextBytes = t.contextDelta.NovelContextBytes
+		event.ContextReuseRatio = t.contextDelta.ContextReuseRatio
+		event.NovelContextRatio = t.contextDelta.NovelContextRatio
+		event.ContextAmplificationRatio = t.contextDelta.ContextAmplificationRatio
+	}
+	if t.contextResponse != nil {
+		response := t.contextResponse.Metrics()
+		event.SSEEventCount = response.SSEEventCount
+		event.OutputItemCount = response.OutputItemCount
+		event.ToolCallCount = response.ToolCallCount
+		event.UsageAvailable = response.UsageAvailable
+		event.InputTokens = response.InputTokens
+		event.CachedInputTokens = response.CachedInputTokens
+		event.OutputTokens = response.OutputTokens
+		event.ReasoningTokens = response.ReasoningTokens
+		event.TotalTokens = response.TotalTokens
+	}
+	return event
 }
 
 func (t *requestTrace) nextAttempt() int {
@@ -481,12 +574,23 @@ func (t *requestTrace) setErrorCategory(category string) {
 	t.errorCategory = category
 }
 
-func (t *requestTrace) enableSSE() {
+func (t *requestTrace) enableSSE(contextKey []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.semantic == nil {
 		t.semantic = newSSEObserver()
 	}
+	if t.routeTemplate == "/backend-api/codex/responses" && t.contextResponse == nil && len(contextKey) > 0 {
+		t.contextResponse = contextobs.NewResponseObserver(contextKey, 0)
+	}
+}
+
+func (t *requestTrace) setContextRequest(metrics contextobs.RequestMetrics, delta contextobs.DeltaMetrics, tracker *contextobs.Tracker) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.contextRequest = metrics
+	t.contextDelta = delta
+	t.contextTracker = tracker
 }
 
 func (t *requestTrace) observeUpstreamBytes(p []byte) {
@@ -495,12 +599,42 @@ func (t *requestTrace) observeUpstreamBytes(p []byte) {
 	if t.semantic != nil {
 		t.semantic.Observe(p)
 	}
+	if t.contextResponse != nil {
+		t.contextResponse.Observe(p)
+	}
 }
 
 func (t *requestTrace) noteBodyEOF() {
+	var tracker *contextobs.Tracker
+	var request contextobs.RequestMetrics
+	var responseRef string
+
+	t.mu.Lock()
+	t.bodyEOF = true
+	if !t.contextBound && t.contextResponse != nil {
+		response := t.contextResponse.Metrics()
+		if response.ResponseRef != "" && t.contextTracker != nil && t.contextRequest.AnalysisStatus == contextobs.AnalysisAnalyzed {
+			t.contextBound = true
+			tracker = t.contextTracker
+			request = t.contextRequest
+			responseRef = response.ResponseRef
+		}
+	}
+	t.mu.Unlock()
+
+	if tracker != nil {
+		tracker.BindResponse(request, responseRef)
+	}
+}
+
+func (t *requestTrace) contextSnapshot() (contextobs.RequestMetrics, contextobs.DeltaMetrics, contextobs.ResponseMetrics) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.bodyEOF = true
+	response := contextobs.ResponseMetrics{}
+	if t.contextResponse != nil {
+		response = t.contextResponse.Metrics()
+	}
+	return t.contextRequest, t.contextDelta, response
 }
 
 func (t *requestTrace) noteUpstreamReadError() {

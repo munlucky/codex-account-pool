@@ -296,6 +296,57 @@ func (h *histogram) Add(value float64) {
 	h.Sum += value
 }
 
+type metricHistogram struct {
+	Bounds []float64 `json:"bounds"`
+	Counts []uint64  `json:"counts"`
+	Count  uint64    `json:"count"`
+	Sum    float64   `json:"sum"`
+}
+
+func newMetricHistogram(bounds []float64) metricHistogram {
+	copyBounds := append([]float64(nil), bounds...)
+	return metricHistogram{Bounds: copyBounds, Counts: make([]uint64, len(copyBounds)+1)}
+}
+
+func (h *metricHistogram) Add(value float64, bounds []float64) {
+	if len(h.Bounds) == 0 || len(h.Counts) != len(h.Bounds)+1 {
+		*h = newMetricHistogram(bounds)
+	}
+	idx := sort.SearchFloat64s(h.Bounds, value)
+	h.Counts[idx]++
+	h.Count++
+	h.Sum += value
+}
+
+type contextDailySummary struct {
+	Analyzed       uint64                     `json:"analyzed"`
+	Skipped        uint64                     `json:"skipped"`
+	SkipReasons    map[string]uint64          `json:"skip_reasons,omitempty"`
+	LineageSources map[string]uint64          `json:"lineage_sources,omitempty"`
+	Metrics        map[string]metricHistogram `json:"metrics,omitempty"`
+
+	InstructionsBytes   int64 `json:"instructions_bytes"`
+	UserBytes           int64 `json:"user_bytes"`
+	AssistantBytes      int64 `json:"assistant_bytes"`
+	ToolOutputBytes     int64 `json:"tool_output_bytes"`
+	ToolDefinitionBytes int64 `json:"tool_definition_bytes"`
+	SystemBytes         int64 `json:"system_bytes"`
+	DeveloperBytes      int64 `json:"developer_bytes"`
+	ReasoningBytes      int64 `json:"reasoning_bytes"`
+	MetadataBytes       int64 `json:"metadata_bytes"`
+	OtherInputBytes     int64 `json:"other_input_bytes"`
+
+	SSEEvents         uint64 `json:"sse_events"`
+	OutputItems       uint64 `json:"output_items"`
+	ToolCalls         uint64 `json:"tool_calls"`
+	UsageRequests     uint64 `json:"usage_requests"`
+	InputTokens       int64  `json:"input_tokens"`
+	CachedInputTokens int64  `json:"cached_input_tokens"`
+	OutputTokens      int64  `json:"output_tokens"`
+	ReasoningTokens   int64  `json:"reasoning_tokens"`
+	TotalTokens       int64  `json:"total_tokens"`
+}
+
 type dailySummary struct {
 	Date               string               `json:"date"`
 	SchemaVersion      int                  `json:"schema_version"`
@@ -309,6 +360,7 @@ type dailySummary struct {
 	TransportFallbacks uint64               `json:"transport_fallbacks"`
 	DroppedEvents      uint64               `json:"dropped_events"`
 	Latency            map[string]histogram `json:"latency"`
+	Context            *contextDailySummary `json:"context,omitempty"`
 }
 
 type dailyStore struct {
@@ -352,6 +404,7 @@ func (d *dailyStore) Record(event Event) error {
 		if event.SemanticOutcome != "" {
 			s.SemanticOutcomes[event.SemanticOutcome]++
 		}
+		recordContextDaily(s, event)
 		if event.GatewayTotalMS >= 0 {
 			h := s.Latency["gateway_total_ms"]
 			h.Add(event.GatewayTotalMS)
@@ -381,6 +434,71 @@ func (d *dailyStore) Record(event Event) error {
 	}
 	d.dirty = true
 	return nil
+}
+
+func recordContextDaily(s *dailySummary, event Event) {
+	if event.ContextAnalysis == "" {
+		return
+	}
+	if s.Context == nil {
+		s.Context = &contextDailySummary{
+			SkipReasons:    map[string]uint64{},
+			LineageSources: map[string]uint64{},
+			Metrics:        map[string]metricHistogram{},
+		}
+	}
+	c := s.Context
+	if c.LineageSources == nil {
+		c.LineageSources = map[string]uint64{}
+	}
+	if event.LineageSource != "" {
+		c.LineageSources[event.LineageSource]++
+	}
+	switch event.ContextAnalysis {
+	case "analyzed":
+		c.Analyzed++
+	case "skipped":
+		c.Skipped++
+		if event.ContextSkipReason != "" {
+			c.SkipReasons[event.ContextSkipReason]++
+		}
+	}
+	addContextMetric(c, "request_bytes", float64(event.RequestBytes), []float64{1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 8388608})
+	if event.ContextBytes > 0 {
+		addContextMetric(c, "context_bytes", float64(event.ContextBytes), []float64{1024, 4096, 16384, 65536, 262144, 1048576, 4194304, 8388608})
+	}
+	if event.ContextDeltaAvailable {
+		addContextMetric(c, "context_growth_bytes", float64(event.ContextGrowthBytes), []float64{-1048576, -262144, -65536, -16384, 0, 16384, 65536, 262144, 1048576})
+		addContextMetric(c, "context_reuse_ratio", event.ContextReuseRatio, []float64{0.25, 0.5, 0.75, 0.9, 0.95, 1})
+		addContextMetric(c, "context_amplification_ratio", event.ContextAmplificationRatio, []float64{1, 2, 5, 10, 20, 50, 100})
+	}
+	c.InstructionsBytes += event.InstructionsBytes
+	c.UserBytes += event.UserBytes
+	c.AssistantBytes += event.AssistantBytes
+	c.ToolOutputBytes += event.ToolOutputBytes
+	c.ToolDefinitionBytes += event.ToolDefinitionBytes
+	c.SystemBytes += event.SystemBytes
+	c.DeveloperBytes += event.DeveloperBytes
+	c.ReasoningBytes += event.ReasoningBytes
+	c.MetadataBytes += event.MetadataBytes
+	c.OtherInputBytes += event.OtherInputBytes
+	c.SSEEvents += uint64(event.SSEEventCount)
+	c.OutputItems += uint64(event.OutputItemCount)
+	c.ToolCalls += uint64(event.ToolCallCount)
+	if event.UsageAvailable {
+		c.UsageRequests++
+		c.InputTokens += event.InputTokens
+		c.CachedInputTokens += event.CachedInputTokens
+		c.OutputTokens += event.OutputTokens
+		c.ReasoningTokens += event.ReasoningTokens
+		c.TotalTokens += event.TotalTokens
+	}
+}
+
+func addContextMetric(c *contextDailySummary, name string, value float64, bounds []float64) {
+	h := c.Metrics[name]
+	h.Add(value, bounds)
+	c.Metrics[name] = h
 }
 
 func (d *dailyStore) ensureDate(date string) error {
@@ -428,6 +546,14 @@ func normalizeDailySummary(s *dailySummary) {
 	}
 	if s.Latency == nil {
 		s.Latency = map[string]histogram{}
+	}
+	if s.Context != nil {
+		if s.Context.SkipReasons == nil {
+			s.Context.SkipReasons = map[string]uint64{}
+		}
+		if s.Context.Metrics == nil {
+			s.Context.Metrics = map[string]metricHistogram{}
+		}
 	}
 }
 

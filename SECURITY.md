@@ -96,6 +96,27 @@ The router returns HTTP 426 only for the `/backend-api/codex/responses` WebSocke
 
 Native CLI login/status/run operations use an isolated `CODEX_HOME` and remove known API-key/token override variables before launching Codex. both platform setup scripts apply the same isolation when invoking the official login command.
 
+## Context Observability data policy
+
+Context Observability is a metadata analyzer, not a traffic-capture facility. It reads the already replayable `/backend-api/codex/responses` wire bytes without rewriting them and observes Responses output incrementally without buffering the complete response for telemetry. When the request uses `Content-Encoding: zstd`, only a bounded observer-side copy is decompressed for structural analysis; the compressed bytes forwarded upstream and used for quota replay are never replaced by the decoded representation.
+
+It may persist only bounded structural metadata such as wire/context byte counts, structural category byte counts, a bounded lineage-source enum, item counts, numeric token usage supplied by the upstream response, ratios, lifecycle counters, and process-local opaque content references. Request/body, item, and lineage references are truncated HMAC-SHA256 values keyed by a random process secret. Stable lineage may use `prompt_cache_key` only after this process-local HMAC transformation; the raw key is never retained or emitted. References are intentionally unstable across process restarts and must not be treated as durable content hashes, account identifiers, or user-tracking identifiers. The transient decoded context bytes themselves are never written to logs or daily summaries.
+
+Context Observability must never persist:
+
+- raw prompt, system, developer, or assistant text;
+- raw response or reasoning text;
+- source code or file contents;
+- terminal output or tool-result contents;
+- function/tool arguments;
+- raw `prompt_cache_key` or other session/cache-affinity identifiers;
+- OAuth/access/refresh/ID tokens, cookies, or raw ChatGPT account IDs;
+- complete HTTP headers, query strings, or raw request/response traffic.
+
+Structural `context_reuse_ratio` measures repeated payload bytes/items observed by the router. It is not a provider prompt-cache hit rate. Only numeric upstream usage such as `cached_input_tokens` is used for actual cache reporting, and missing token usage is reported as unavailable rather than inferred from bytes.
+
+Context analysis is fail-open with respect to the data plane: malformed JSON, invalid/unsupported content encoding, oversized decoded payloads, or other unsupported telemetry input may reduce observability coverage but must not fail an otherwise valid proxied request. Decoder work is bounded; observer decode failures are telemetry failures only.
+
 ## Testing and repository hygiene
 
 Automated tests must use synthetic credentials and local test servers. Never commit or attach real:
