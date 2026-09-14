@@ -4,6 +4,8 @@
 # directory when GPT_CODEX_ROUTER_HOME is intentionally pointed into a checkout.
 /.gpt-codex-router/
 /registry.json
+/client-key
+/codex-client-version
 /profiles/
 
 # Legacy/local configuration and credential material

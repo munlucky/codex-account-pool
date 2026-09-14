@@ -7,6 +7,8 @@
 dist
 .gpt-codex-router
 registry.json
+client-key
+codex-client-version
 profiles
 accounts
 tokens

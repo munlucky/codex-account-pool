@@ -2,7 +2,7 @@
 
 ## Trust boundary
 
-GPT Codex Router is a **local-only, single-user ChatGPT subscription gateway**. It handles Codex OAuth credentials, so its security model depends on keeping the HTTP listener on the same machine as the user.
+GPT Codex Router is a **local-only, single-user ChatGPT subscription gateway**. It handles Codex OAuth credentials, so its security model depends on keeping the HTTP listener on the same trusted machine as the user. Loopback binding limits network exposure; it is not authentication between local processes.
 
 ```text
 Codex Desktop -> host loopback -> GPT Codex Router -> chatgpt.com
@@ -21,7 +21,7 @@ Windows: %APPDATA%\GPTCodexRouter\profiles\codex\<profile>
 macOS:   ~/Library/Application Support/GPTCodexRouter/profiles/codex/<profile>
 ```
 
-The router reads the selected profile's Codex `auth.json` only to authenticate ChatGPT backend requests and maintain that same profile's OAuth refresh lifecycle.
+The router reads the selected profile's Codex `auth.json` only to authenticate ChatGPT backend requests and maintain that same profile's OAuth refresh lifecycle. A separate router-local `client-key` is stored at the state root and is used only to authenticate `/v1/*` callers; it is never used as upstream ChatGPT authentication.
 
 The project must never:
 
@@ -45,7 +45,7 @@ host:      127.0.0.1:8317
 
 Additional container controls:
 
-- the platform state directory is bind-mounted at `/data`; credential files are never copied into the image or build context;
+- the platform state directory is bind-mounted at `/data`, and the managed `profiles/` state path is excluded from the supplied Docker build context; keep standalone credential files such as `auth.json` out of the source checkout rather than relying on filename-based ignore rules;
 - the runtime process runs as a non-root user;
 - Linux capabilities are dropped;
 - `no-new-privileges` is enabled;
@@ -55,9 +55,17 @@ Only one router process should actively use a profile directory at a time. The s
 
 ## Upstream request sanitization
 
-Only `/backend-api` and `/backend-api/*` are accepted for proxying. Before an upstream request is sent, the router removes inbound authentication-bearing headers and attaches only the credentials selected from local profile state.
+`/backend-api` and `/backend-api/*` remain the Codex passthrough routes. `/v1/responses`, `/v1/chat/completions`, and `/v1/models` are local compatibility routes and require `Authorization: Bearer <client-key>`. The compatibility layer removes that local authorization header before handing a request to the backend gateway. Before any upstream request is sent, the gateway removes inbound authentication-bearing headers and attaches only the credentials selected from local profile state.
 
 The local `GET /healthz` route is handled without reading profile credentials or contacting ChatGPT.
+
+## Local OpenAI-compatible API
+
+The `/v1/*` surface is intended for local development clients only. It does not turn the router into a network service: the same loopback-only host boundary applies. The local client key is generated from cryptographically random bytes, stored outside the repository, and should be treated as a bearer secret.
+
+`/v1/responses` performs local authentication/path adaptation and injects router-controlled Codex compatibility headers before entering the existing gateway. Because the ChatGPT Codex backend requires item-list input, `store:false`, and `stream:true`, the adapter normalizes OpenAI string input, injects `store:false`, and always streams upstream. Non-streaming local callers receive a reconstructed completed JSON response assembled from the upstream SSE events. Explicit `store:true` is rejected rather than silently changing that caller-requested semantic. `/v1/chat/completions` translates a bounded supported subset into Responses requests and translates Responses output back to Chat Completions using the same backend-required `store:false`/`stream:true` contract. Unsupported request fields are rejected rather than silently discarded. `/v1/models` resolves the installed Codex client version from managed state (falling back to an existing Codex model cache), requests `/backend-api/codex/models?client_version=<version>`, and normalizes only the returned model identifiers. Caller-supplied `originator`, `version`, and `client_version` values are not trusted as the upstream Codex identity contract.
+
+Do not publish the listener to a LAN or the public internet even when `/v1/*` authentication is enabled. The client key is defense in depth for local callers; it does not change the product's single-user trust model.
 
 ## OAuth refresh lifecycle
 
@@ -128,7 +136,7 @@ Automated tests must use synthetic credentials and local test servers. Never com
 - environment files containing credentials;
 - private proxy logs containing request data.
 
-Runtime profile directories, common credential exports, environment files, logs, and build output are ignored by Git. Always inspect `git status` and the staged diff before publishing.
+Managed runtime profile directories, common credential exports, environment files, `*.log` files, and build output are ignored by Git. A standalone file named `auth.json` outside the managed profile directory is credential material and must not be placed in the source checkout. Always inspect `git status` and the staged diff before publishing.
 
 ## Reporting a vulnerability
 

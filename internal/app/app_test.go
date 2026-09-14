@@ -184,6 +184,8 @@ func TestServerHealthEndpointIsLocalAndDoesNotReachProxy(t *testing.T) {
 	handler := serverHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		proxyCalls++
 		w.WriteHeader(http.StatusTeapot)
+	}), http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
 	}))
 
 	req := httptest.NewRequest(http.MethodGet, "http://localhost/healthz", nil)
@@ -198,6 +200,58 @@ func TestServerHealthEndpointIsLocalAndDoesNotReachProxy(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusTeapot || proxyCalls != 1 {
 		t.Fatalf("proxy status=%d proxyCalls=%d", rec.Code, proxyCalls)
+	}
+}
+
+func TestServerRoutesV1SeparatelyFromBackendAPI(t *testing.T) {
+	backendCalls := 0
+	openAICalls := 0
+	handler := serverHandler(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			backendCalls++
+			w.WriteHeader(http.StatusTeapot)
+		}),
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			openAICalls++
+			w.WriteHeader(http.StatusCreated)
+		}),
+	)
+
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{path: "/backend-api/codex/responses", want: http.StatusTeapot},
+		{path: "/v1/responses", want: http.StatusCreated},
+		{path: "/v1/chat/completions", want: http.StatusCreated},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "http://localhost"+tc.path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != tc.want {
+			t.Fatalf("path=%s status=%d want=%d", tc.path, rec.Code, tc.want)
+		}
+	}
+	if backendCalls != 1 || openAICalls != 2 {
+		t.Fatalf("backendCalls=%d openAICalls=%d", backendCalls, openAICalls)
+	}
+}
+
+func TestAPIKeyCommandCreatesStableLocalKey(t *testing.T) {
+	a, _, out := newTestApp(t)
+	if err := a.Execute(context.Background(), []string{"api-key"}); err != nil {
+		t.Fatal(err)
+	}
+	first := strings.TrimSpace(out.String())
+	if !strings.HasPrefix(first, "gcr_") {
+		t.Fatalf("unexpected key=%q", first)
+	}
+	out.Reset()
+	if err := a.Execute(context.Background(), []string{"api-key"}); err != nil {
+		t.Fatal(err)
+	}
+	if second := strings.TrimSpace(out.String()); second != first {
+		t.Fatalf("api key changed: first=%q second=%q", first, second)
 	}
 }
 

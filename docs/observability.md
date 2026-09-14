@@ -6,7 +6,7 @@ The router records a bounded JSONL request lifecycle and keeps HTTP status separ
 
 Each proxied request emits one `request_start` and one `request_end`. Intermediate events can include `upstream_attempt`, `account_switch`, and `transport_fallback`.
 
-Important fields are `request_id`, `route_template`, `transport`, `peer_class`, `profile_ref`, `status_code`, `status_origin`, `outcome`, `semantic_outcome`, `auth_ms`, `upstream_headers_ms`, `first_body_ms`, `gateway_total_ms`, and `response_bytes`.
+Important fields are `request_id`, `route_template`, `api_surface`, `transport`, `peer_class`, `profile_ref`, `status_code`, `status_origin`, `outcome`, `semantic_outcome`, `auth_ms`, `upstream_headers_ms`, `first_body_ms`, `gateway_total_ms`, and `response_bytes`. `api_surface` distinguishes native Codex backend traffic (`codex_backend`) from local compatibility calls such as `openai_responses`, `openai_chat_completions`, and `openai_models`, while `route_template` continues to describe the actual backend route.
 
 `profile_ref` is a process-local pseudonymous reference. Dynamic paths are reduced to bounded route templates. The logger does not persist request or response bodies or query strings.
 

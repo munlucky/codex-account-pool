@@ -17,6 +17,8 @@ $registryPath = Join-Path $stateRoot 'registry.json'
 $codexConfigPath = Join-Path $env:USERPROFILE '.codex\config.toml'
 $profilePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 $composeEnvPath = Join-Path $repoRoot '.env'
+$clientKeyPath = Join-Path $stateRoot 'client-key'
+$codexClientVersionPath = Join-Path $stateRoot 'codex-client-version'
 
 function Require-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
@@ -167,6 +169,44 @@ function Set-CodexDesktopConfig {
 }
 
 
+function Write-CodexClientVersion {
+    New-Item -ItemType Directory -Force -Path $stateRoot | Out-Null
+    $versionOutput = (& codex --version 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not read Codex version (exit code $LASTEXITCODE)."
+    }
+    if ($versionOutput -notmatch '(?<!\d)(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)(?!\d)') {
+        throw "Could not parse Codex version from: $versionOutput"
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($codexClientVersionPath, $Matches[1] + [Environment]::NewLine, $utf8NoBom)
+}
+
+function Ensure-ClientApiKey {
+    New-Item -ItemType Directory -Force -Path $stateRoot | Out-Null
+    if (Test-Path $clientKeyPath) {
+        $existing = [System.IO.File]::ReadAllText($clientKeyPath).Trim()
+        if ($existing.StartsWith('gcr_') -and $existing.Length -ge 32) {
+            return $existing
+        }
+        throw "Existing local API key at $clientKeyPath is invalid. Remove it manually only if you intend to rotate the key."
+    }
+
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    }
+    finally {
+        $rng.Dispose()
+    }
+    $encoded = [Convert]::ToBase64String($bytes).TrimEnd([char]'=').Replace('+', '-').Replace('/', '_')
+    $key = "gcr_$encoded"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($clientKeyPath, $key + [Environment]::NewLine, $utf8NoBom)
+    return $key
+}
+
 function Write-ComposeEnvironment {
     $composePath = ($stateRoot -replace '\\', '/').Replace("'", "\'")
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -227,6 +267,8 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Docker Desktop is not running or its engine is unavailable.'
 }
 
+Write-CodexClientVersion
+$clientApiKey = Ensure-ClientApiKey
 Write-ComposeEnvironment
 Stop-ExistingRouter
 
@@ -287,6 +329,8 @@ if (-not $NoStart) {
     }
     Write-Host ''
     Write-Host 'GPT Codex Router is running at http://127.0.0.1:8317' -ForegroundColor Green
+    Write-Host 'OpenAI-compatible base URL: http://127.0.0.1:8317/v1' -ForegroundColor Green
+    Write-Host "Local API key file: $clientKeyPath" -ForegroundColor DarkGray
     if (-not $SkipCodexConfig) {
         Write-Host 'Restart Codex Desktop completely before using it.' -ForegroundColor Yellow
     }
@@ -294,6 +338,7 @@ if (-not $NoStart) {
 }
 else {
     Write-Host 'Login setup complete. Start the router later with: docker compose up -d --build'
+    Write-Host "OpenAI-compatible API key is stored at: $clientKeyPath" -ForegroundColor DarkGray
     if (-not $SkipCodexConfig) {
         Write-Host 'Codex Desktop config was not changed because -NoStart was used.' -ForegroundColor Yellow
     }

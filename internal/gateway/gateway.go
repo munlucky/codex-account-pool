@@ -39,6 +39,7 @@ type failoverCredentialProvider interface {
 
 type credentialContextKey struct{}
 type traceContextKey struct{}
+type apiSurfaceContextKey struct{}
 
 type RequestEvent = observability.Event
 type RequestLogger func(RequestEvent)
@@ -65,6 +66,7 @@ type requestTrace struct {
 	id              string
 	method          string
 	routeTemplate   string
+	apiSurface      string
 	transport       string
 	peerClass       string
 	started         time.Time
@@ -171,11 +173,25 @@ func (h *Handler) SetRequestLogger(logger RequestLogger) {
 	h.logger = logger
 }
 
+func WithAPISurface(ctx context.Context, surface string) context.Context {
+	return context.WithValue(ctx, apiSurfaceContextKey{}, strings.TrimSpace(surface))
+}
+
+func apiSurfaceFromRequest(r *http.Request) string {
+	if r != nil {
+		if surface, _ := r.Context().Value(apiSurfaceContextKey{}).(string); strings.TrimSpace(surface) != "" {
+			return surface
+		}
+	}
+	return "codex_backend"
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	trace := &requestTrace{
 		id:            newRequestID(),
 		method:        r.Method,
 		routeTemplate: routeTemplate(r.URL.Path),
+		apiSurface:    apiSurfaceFromRequest(r),
 		transport:     requestTransport(r),
 		peerClass:     peerClass(r.RemoteAddr),
 		started:       time.Now(),
@@ -207,7 +223,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		trace.setStatus(http.StatusUpgradeRequired, "local")
 		h.emit(observability.Event{
 			EventType: observability.EventTransportFallback,
-			RequestID: trace.id, Method: trace.method, RouteTemplate: trace.routeTemplate,
+			RequestID: trace.id, Method: trace.method, RouteTemplate: trace.routeTemplate, APISurface: trace.apiSurface,
 			Transport: trace.transport, PeerClass: trace.peerClass,
 			StatusCode: http.StatusUpgradeRequired, StatusOrigin: "local", TransportFallback: true,
 		})
@@ -270,7 +286,7 @@ func (h *Handler) emitAttempt(req *http.Request, attempt int, profileID string, 
 	}
 	event := observability.Event{
 		EventType: observability.EventUpstreamAttempt,
-		RequestID: trace.id, Method: trace.method, RouteTemplate: trace.routeTemplate,
+		RequestID: trace.id, Method: trace.method, RouteTemplate: trace.routeTemplate, APISurface: trace.apiSurface,
 		Transport: trace.transport, PeerClass: trace.peerClass, ProfileRef: h.profileRef(profileID),
 		Attempt: attempt, UpstreamHeadersMS: durationMS(elapsed),
 	}
@@ -297,7 +313,7 @@ func (h *Handler) emitSwitch(req *http.Request, from, to string) {
 	trace.setProfileRef(toRef)
 	h.emit(observability.Event{
 		EventType: observability.EventAccountSwitch,
-		RequestID: trace.id, Method: trace.method, RouteTemplate: trace.routeTemplate,
+		RequestID: trace.id, Method: trace.method, RouteTemplate: trace.routeTemplate, APISurface: trace.apiSurface,
 		Transport: trace.transport, PeerClass: trace.peerClass,
 		SwitchFromRef: h.profileRef(from), SwitchToRef: toRef,
 	})
@@ -440,7 +456,7 @@ func (w *instrumentedResponseWriter) CloseNotify() <-chan bool {
 func (t *requestTrace) startEvent() observability.Event {
 	return observability.Event{
 		Timestamp: t.started.UTC(), EventType: observability.EventRequestStart,
-		RequestID: t.id, Method: t.method, RouteTemplate: t.routeTemplate,
+		RequestID: t.id, Method: t.method, RouteTemplate: t.routeTemplate, APISurface: t.apiSurface,
 		Transport: t.transport, PeerClass: t.peerClass,
 	}
 }
@@ -478,7 +494,7 @@ func (t *requestTrace) endEvent(ctxErr error, writerStatus int) observability.Ev
 	}
 	event := observability.Event{
 		EventType: observability.EventRequestEnd,
-		RequestID: t.id, Method: t.method, RouteTemplate: t.routeTemplate,
+		RequestID: t.id, Method: t.method, RouteTemplate: t.routeTemplate, APISurface: t.apiSurface,
 		Transport: t.transport, PeerClass: t.peerClass, ProfileRef: t.profileRef,
 		StatusCode: t.statusCode, StatusOrigin: t.statusOrigin, Outcome: outcome,
 		ErrorCategory: t.errorCategory, GatewayTotalMS: durationMS(time.Since(t.started)),
@@ -697,6 +713,8 @@ func routeTemplate(path string) string {
 		return "/backend-api"
 	case "/backend-api/codex/responses":
 		return "/backend-api/codex/responses"
+	case "/backend-api/codex/models":
+		return "/backend-api/codex/models"
 	case "/backend-api/models":
 		return "/backend-api/models"
 	}

@@ -15,8 +15,11 @@ import (
 	"time"
 
 	"github.com/munlucky/codex-account-pool/internal/authbroker"
+	"github.com/munlucky/codex-account-pool/internal/clientauth"
+	"github.com/munlucky/codex-account-pool/internal/codexmeta"
 	"github.com/munlucky/codex-account-pool/internal/gateway"
 	"github.com/munlucky/codex-account-pool/internal/observability"
+	"github.com/munlucky/codex-account-pool/internal/openaiapi"
 	"github.com/munlucky/codex-account-pool/internal/process"
 	"github.com/munlucky/codex-account-pool/internal/profile"
 )
@@ -62,6 +65,8 @@ func (a *App) Execute(ctx context.Context, args []string) error {
 		return a.executeRun(ctx, args[1:])
 	case "serve":
 		return a.executeServe(ctx, args[1:])
+	case "api-key":
+		return a.executeAPIKey(args[1:])
 	case "report":
 		return a.executeReport(args[1:])
 	case "help", "--help", "-h":
@@ -262,6 +267,18 @@ func (a *App) executeRun(ctx context.Context, args []string) error {
 	return a.Executor.Run(ctx, codexCommand(a.CodexBin, a.Store.CodexHome(p.ID), opts.clientArgs))
 }
 
+func (a *App) executeAPIKey(args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("%w: usage: api-key", ErrUsage)
+	}
+	key, err := clientauth.Ensure(a.Store.Root())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(a.Out, key)
+	return nil
+}
+
 func (a *App) executeServe(ctx context.Context, args []string) error {
 	listen, err := parseServeArgs(args)
 	if err != nil {
@@ -289,10 +306,24 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 	}
 	defer logger.Close()
 	handler.SetRequestLogger(logger.Emit)
+	clientKey, err := clientauth.Ensure(a.Store.Root())
+	if err != nil {
+		return fmt.Errorf("initialize local API authentication: %w", err)
+	}
+	clientVersion, versionErr := codexmeta.ResolveClientVersion(a.Store.Root())
+	if versionErr != nil {
+		fmt.Fprintf(a.Err, "warning: OpenAI-compatible model listing disabled until Codex client version is available: %v\n", versionErr)
+	} else if err := codexmeta.PersistClientVersion(a.Store.Root(), clientVersion); err != nil {
+		fmt.Fprintf(a.Err, "warning: could not persist Codex client version: %v\n", err)
+	}
+	openAIHandler, err := openaiapi.New(handler, clientKey, clientVersion)
+	if err != nil {
+		return err
+	}
 	logger.Emit(observability.Event{EventType: observability.EventStartup})
 	server := &http.Server{
 		Addr:              listen,
-		Handler:           serverHandler(handler),
+		Handler:           serverHandler(handler, openAIHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -346,7 +377,7 @@ func requireSafeListenAddress(address string) error {
 	return fmt.Errorf("refusing non-loopback listen address %q; use loopback, or container mode with an unspecified container address behind a host loopback port mapping", address)
 }
 
-func serverHandler(proxy http.Handler) http.Handler {
+func serverHandler(backend, openAI http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -354,7 +385,11 @@ func serverHandler(proxy http.Handler) http.Handler {
 			_, _ = io.WriteString(w, "ok\n")
 			return
 		}
-		proxy.ServeHTTP(w, r)
+		if r.URL.Path == "/v1" || strings.HasPrefix(r.URL.Path, "/v1/") {
+			openAI.ServeHTTP(w, r)
+			return
+		}
+		backend.ServeHTTP(w, r)
 	})
 }
 
@@ -407,13 +442,18 @@ Usage:
   gpt-codex-router auth use codex <profile>
   gpt-codex-router auth status codex [profile]
   gpt-codex-router serve [--listen 127.0.0.1:8317]
+  gpt-codex-router api-key
   gpt-codex-router report [--since 3h] [--timezone Asia/Seoul] [--file <jsonl>|--stdin]
   gpt-codex-router run codex [--profile <id>] [-- <client args...>]
   gpt-codex-router version
+
+OpenAI-compatible API:
+  base_url = "http://127.0.0.1:8317/v1"
+  api_key  = output of gpt-codex-router api-key
 
 Codex Desktop setup:
   chatgpt_base_url = "http://127.0.0.1:8317/backend-api"
   openai_base_url = "http://127.0.0.1:8317/backend-api/codex"
 
-The openai_base_url setting is required so both existing and new OpenAI-provider threads route Responses inference through GPT Codex Router. The gateway returns 426 only for the Responses WebSocket endpoint, causing Codex to fall back to HTTP while other backend WebSockets continue to proxy normally. The gateway accepts only /backend-api/* plus a local /healthz probe, ignores inbound auth, and injects auth from the selected Codex ChatGPT profile. Native mode is loopback-only. Container mode may listen on the container wildcard address only when GPT_CODEX_ROUTER_CONTAINER=1; publish that port to host loopback only. Confirmed subscription usage limits may fail over to another registered profile.`))
+The openai_base_url setting is required so both existing and new OpenAI-provider threads route Responses inference through GPT Codex Router. The gateway returns 426 only for the Responses WebSocket endpoint, causing Codex to fall back to HTTP while other backend WebSockets continue to proxy normally. The gateway keeps /backend-api/* as the Codex passthrough surface and exposes authenticated /v1/responses, /v1/chat/completions, and /v1/models for local OpenAI-compatible clients. Backend credentials are never taken from inbound client headers; the selected Codex ChatGPT profile is injected internally. Native mode is loopback-only. Container mode may listen on the container wildcard address only when GPT_CODEX_ROUTER_CONTAINER=1; publish that port to host loopback only. Confirmed subscription usage limits may fail over to another registered profile.`))
 }

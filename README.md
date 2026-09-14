@@ -1,8 +1,8 @@
 # GPT Codex Router
 
-Local, Docker-first ChatGPT subscription profile routing for Codex Desktop and Codex CLI.
+Local, Docker-first ChatGPT authentication routing for Codex Desktop, Codex CLI, and OpenAI-compatible local LLM clients.
 
-GPT Codex Router lets you sign in to multiple ChatGPT accounts through the **official Codex login flow**, keeps each account in an isolated `CODEX_HOME`, and routes Codex Desktop backend traffic through the selected profile. When ChatGPT returns a confirmed subscription usage-limit response, the router can move to the next registered profile and replay that request.
+GPT Codex Router lets you sign in to multiple ChatGPT accounts through the **official Codex login flow**, keeps each account in an isolated `CODEX_HOME`, and routes Codex backend traffic through the selected profile. The same local service also exposes authenticated OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and `/v1/models` endpoints. When ChatGPT returns a confirmed subscription usage-limit response, the router can move to the next registered profile and replay that request.
 
 > **Unofficial project.** This repository is not affiliated with or endorsed by OpenAI. OpenAI, ChatGPT, GPT, and Codex names are used only to describe interoperability. Use only accounts you are authorized to use and follow the applicable product terms and limits.
 
@@ -57,7 +57,7 @@ Homebrew is also supported upstream with `brew install --cask codex`. See the [u
 Windows:
 
 ```powershell
-git clone https://github.com/munlucky/codex-account-pool.git
+git clone https://github.com/munlucky/codex-account-pool.git gpt-codex-router
 cd gpt-codex-router
 .\setup.cmd
 ```
@@ -65,7 +65,7 @@ cd gpt-codex-router
 macOS:
 
 ```bash
-git clone https://github.com/munlucky/codex-account-pool.git
+git clone https://github.com/munlucky/codex-account-pool.git gpt-codex-router
 cd gpt-codex-router
 ./setup.sh
 ```
@@ -136,16 +136,15 @@ Expected health body:
 ok
 ```
 
-A normal request produces credential-safe logs similar to:
+A normal request emits structured JSONL lifecycle events. Values below are abbreviated examples; real request/profile references are process-local opaque values:
 
-```text
-GPT Codex Router ChatGPT gateway listening on http://0.0.0.0:8317/backend-api (active codex profile: personal)
-proxy personal POST 200
-switch personal -> work quota
-proxy work POST 200
+```json
+{"schema_version":1,"event_type":"request_start","request_id":"r_...","method":"POST","route_template":"/backend-api/codex/responses","transport":"http","peer_class":"container-network"}
+{"schema_version":1,"event_type":"upstream_attempt","request_id":"r_...","profile_ref":"p_...","status_code":200,"status_origin":"upstream","attempt":1}
+{"schema_version":1,"event_type":"request_end","request_id":"r_...","profile_ref":"p_...","status_code":200,"outcome":"body_eof","semantic_outcome":"completed"}
 ```
 
-Tokens, ChatGPT account IDs, prompt bodies, and provider error bodies are not logged.
+OAuth/access/refresh/ID token values, raw ChatGPT account IDs, prompt/response bodies, query strings, complete headers, and provider error bodies are not logged. Numeric token-usage counters supplied by ChatGPT (for example `input_tokens` or `cached_input_tokens`) may be recorded as observability metadata.
 
 ## What setup changes
 
@@ -158,7 +157,7 @@ Windows: %APPDATA%\GPTCodexRouter
 macOS:   ~/Library/Application Support/GPTCodexRouter
 ```
 
-Each Codex login is isolated below `profiles/codex/<profile>/auth.json`. Docker bind-mounts the platform state directory as `/data`; credentials are not copied into the image or Docker build context.
+Each Codex login is isolated below `profiles/codex/<profile>/auth.json`. Docker bind-mounts the platform state directory as `/data`, and the managed `profiles/` state path is excluded from the repository build context. Keep credential files in this managed state directory; do not copy standalone `auth.json` files into the source checkout.
 
 The setup script writes only the selected host-state path to the ignored repository-local `.env` file so ordinary `docker compose ...` commands use the same mount later. The `.env` file does not contain ChatGPT tokens.
 
@@ -178,6 +177,37 @@ Use `-SkipCodexConfig` on Windows or `--skip-codex-config` on macOS if you want 
 Both base URLs are required for quota-aware routing. `chatgpt_base_url` routes ChatGPT backend services through the gateway. `openai_base_url` also routes the built-in OpenAI provider's Responses endpoint through it, including existing threads that retain `model_provider = "openai"`.
 
 For `/backend-api/codex/responses`, GPT Codex Router rejects only the Responses WebSocket upgrade with HTTP 426 so Codex falls back to HTTP/SSE. That makes a confirmed usage-limit response observable and replayable. Other backend WebSocket routes continue through the reverse proxy normally.
+
+## OpenAI-compatible local API
+
+The same `127.0.0.1:8317` listener exposes a local OpenAI-compatible surface without changing the existing Codex Desktop routes:
+
+```text
+POST /v1/responses
+POST /v1/chat/completions
+GET  /v1/models
+```
+
+`/v1/*` requires a router-local API key. This key is separate from the ChatGPT OAuth credentials and is stored next to the router state as `client-key`. Retrieve it from the running container with:
+
+```bash
+docker compose exec -T gpt-codex-router gpt-codex-router api-key
+```
+
+Use these client settings:
+
+```text
+base URL: http://127.0.0.1:8317/v1
+API key:  <output of gpt-codex-router api-key>
+```
+
+Clients that support the OpenAI Responses protocol should prefer `/v1/responses`. The local adapter accepts the OpenAI string `input` shorthand and converts it to Codex response items, forces the backend-required `store:false` and `stream:true`, and injects Codex-compatible `originator`/`version` headers. If the caller requested `stream:false` (or omitted `stream`), the adapter collects the Codex SSE stream and rebuilds the completed JSON response, including `response.output_item.done` items; `stream:true` callers receive the SSE stream directly. Explicit `store:true` is rejected because the ChatGPT Codex backend does not support that semantic.
+
+`/v1/chat/completions` is a compatibility adapter for clients that still require Chat Completions. It translates text messages, image URL content, function tools/tool calls, reasoning effort, max completion tokens, structured response formats, streaming deltas, and token usage. Its internal Responses request also always uses the backend-required `store:false` and `stream:true`; non-streaming Chat callers receive an assembled JSON completion. Unsupported Chat Completions fields are rejected with HTTP 400 instead of being silently discarded.
+
+`/v1/models` reads the Codex client version managed in router state (or recovers it from an existing Codex `models_cache.json`) and requests `/backend-api/codex/models?client_version=<version>`. Setup records the installed `codex --version` in `codex-client-version` so model discovery follows the same catalog contract as Codex itself.
+
+The local client `Authorization` header is removed before the request enters the backend gateway. The gateway then injects only the selected ChatGPT/Codex profile credentials, so the local API key is never forwarded to ChatGPT.
 
 ## Codex compatibility
 
@@ -264,7 +294,7 @@ macOS:   ~/Library/Application Support/GPTCodexRouter
 
 ## Manual / developer build
 
-Go 1.23 or newer is required only when building the native binary directly.
+For native development, use a currently supported Go toolchain. As of September 2026, Go 1.26 or Go 1.27 is recommended; the module's language version remains `go 1.23`. The normal Docker setup does not require a host Go installation.
 
 ```bash
 make test
@@ -291,9 +321,9 @@ Native mode is loopback-only by design:
 
 GPT Codex Router handles bearer credentials for your ChatGPT/Codex sessions. It is therefore intentionally local-only.
 
-- Native listeners must be loopback addresses.
+- Native listeners must be loopback addresses. Loopback limits network exposure but does not authenticate other processes running as the local user, so the router is intended for a trusted single-user machine.
 - Docker listens on `0.0.0.0:8317` **inside the container only**; Compose publishes it as `127.0.0.1:8317` on the host.
-- Only `/backend-api` and `/backend-api/*` are proxied.
+- `/backend-api` and `/backend-api/*` remain the Codex passthrough surface. Authenticated `/v1/*` routes are handled by the local OpenAI-compatible adapter and then enter the same credential/failover gateway.
 - Inbound auth/cookie headers are removed before the selected profile credentials are attached upstream.
 - OAuth refresh is constrained to the selected profile and rejects an account-identity change.
 - Real credentials are never needed by the automated test suite.

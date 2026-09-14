@@ -6,6 +6,8 @@ state_root="${HOME}/Library/Application Support/GPTCodexRouter"
 registry_path="${state_root}/registry.json"
 codex_config_path="${HOME}/.codex/config.toml"
 compose_env_path="${repo_root}/.env"
+client_key_path="${state_root}/client-key"
+codex_client_version_path="${state_root}/codex-client-version"
 profile_pattern='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 skip_codex_config=0
 no_start=0
@@ -92,6 +94,32 @@ write_registry() {
   } > "$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$registry_path"
+}
+
+write_codex_client_version() {
+  local version
+  version="$(codex --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?' | head -n 1 || true)"
+  [ -n "$version" ] || fail 'Could not parse Codex version from codex --version.'
+  printf '%s\n' "$version" > "$codex_client_version_path"
+  chmod 600 "$codex_client_version_path"
+}
+
+ensure_client_api_key() {
+  mkdir -p "$state_root"
+  chmod 700 "$state_root"
+  if [ -f "$client_key_path" ]; then
+    local existing
+    existing="$(tr -d '\r\n' < "$client_key_path")"
+    case "$existing" in
+      gcr_????????????????????????????*) printf '%s\n' "$existing"; return 0 ;;
+      *) fail "Existing local API key at $client_key_path is invalid. Remove it manually only if you intend to rotate the key." ;;
+    esac
+  fi
+  local key
+  key="gcr_$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  printf '%s\n' "$key" > "$client_key_path"
+  chmod 600 "$client_key_path"
+  printf '%s\n' "$key"
 }
 
 write_compose_env() {
@@ -205,6 +233,8 @@ docker info --format '{{.ServerVersion}}' >/dev/null 2>&1 || fail 'Docker Deskto
 
 mkdir -p "$state_root"
 chmod 700 "$state_root"
+write_codex_client_version
+client_api_key="$(ensure_client_api_key)"
 write_compose_env
 stop_existing_router
 read_existing_registry
@@ -257,12 +287,15 @@ if [ "$no_start" -eq 0 ]; then
     set_codex_desktop_config
   fi
   printf '\nGPT Codex Router is running at http://127.0.0.1:8317\n'
+  printf 'OpenAI-compatible base URL: http://127.0.0.1:8317/v1\n'
+  printf 'Local API key file: %s\n' "$client_key_path"
   if [ "$skip_codex_config" -eq 0 ]; then
     printf 'Restart Codex Desktop completely before using it.\n'
   fi
   printf 'Logs: docker compose logs -f --tail=100 gpt-codex-router\n'
 else
   printf 'Login setup complete. Start the router later with: docker compose up -d --build\n'
+  printf 'OpenAI-compatible API key is stored at: %s\n' "$client_key_path"
   if [ "$skip_codex_config" -eq 0 ]; then
     printf 'Codex Desktop config was not changed because --no-start was used.\n'
   fi
