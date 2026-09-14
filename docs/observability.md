@@ -10,11 +10,22 @@ Important fields are `request_id`, `route_template`, `api_surface`, `transport`,
 
 `profile_ref` is a process-local pseudonymous reference. Dynamic paths are reduced to bounded route templates. The logger does not persist request or response bodies or query strings.
 
+Compatibility calls preserve both views of the request:
+
+| Local entry point | `api_surface` | backend `route_template` |
+| --- | --- | --- |
+| `POST /v1/responses` | `openai_responses` | `/backend-api/codex/responses` |
+| `POST /v1/chat/completions` | `openai_chat_completions` | `/backend-api/codex/responses` |
+| `GET /v1/models` | `openai_models` | `/backend-api/codex/models` |
+| native Codex traffic | `codex_backend` | native `/backend-api/...` route |
+
+This allows reports to separate Qwen/OpenAI-compatible clients from native Codex traffic without inventing a second lifecycle logger.
+
 For a streaming request, `status_code=200` is not proof that delivery completed. Inspect `outcome` and `semantic_outcome` as separate dimensions.
 
 ## Context Observability
 
-Context Observability applies to `POST /backend-api/codex/responses`. It starts from the exact byte slice already buffered for quota-aware replay and never re-marshals or rewrites the upstream request. If those wire bytes are Zstd encoded, a bounded observer-only copy is decoded for JSON structure analysis while the original compressed bytes remain the source for upstream transmission and failover replay. Responses stream observation is incremental and does not collect the full response body; the exact Responses POST route enables the stream parser even when the upstream Content-Type is not labeled `text/event-stream`.
+Context Observability applies to the backend `POST /backend-api/codex/responses` request after any local compatibility adaptation. For native Codex traffic this is the original Codex request. For `/v1/responses` it is the normalized Responses payload; for `/v1/chat/completions` it is the translated Responses payload. Therefore Context Observability describes the bytes actually sent toward ChatGPT, not necessarily the caller's original local `/v1` JSON. It starts from the exact byte slice already buffered for quota-aware replay and never re-marshals or rewrites the upstream request. If those wire bytes are Zstd encoded, a bounded observer-only copy is decoded for JSON structure analysis while the original compressed bytes remain the source for upstream transmission and failover replay. Responses stream observation is incremental and does not collect the full response body; the exact Responses POST route enables the stream parser even when the upstream Content-Type is not labeled `text/event-stream`.
 
 Persisted request metadata can include:
 
@@ -54,6 +65,15 @@ The logger uses a bounded asynchronous queue. Queue overflow is surfaced later w
 Docker Compose also limits stdout JSON logs to 20 MiB x five files. Docker builds resolve the current Git HEAD from minimal repository metadata included in the build context, so `service_commit` identifies the source revision even when `docker compose up --build` is run directly. An explicit `COMMIT` build arg still overrides this resolution when needed.
 
 ## Reports
+
+Normal Docker installation:
+
+```sh
+docker compose exec gpt-codex-router \
+  gpt-codex-router report --since 3h --timezone Asia/Seoul
+```
+
+Native development binary:
 
 ```sh
 gpt-codex-router report --since 3h --timezone Asia/Seoul

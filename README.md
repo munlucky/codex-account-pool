@@ -11,20 +11,30 @@ GPT Codex Router lets you sign in to multiple ChatGPT accounts through the **off
 Codex Desktop normally uses one ChatGPT login context. GPT Codex Router adds a small local routing layer without modifying the Desktop app, MSIX package, renderer, or Codex binaries.
 
 ```text
-Codex Desktop
+Codex Desktop / Codex CLI
    |
    | chatgpt_base_url + openai_base_url
-   v
-127.0.0.1:8317
    |
-   v
-GPT Codex Router (Docker)
-   |- account-1 -> isolated CODEX_HOME/auth.json
-   |- account-2 -> isolated CODEX_HOME/auth.json
-   `- account-N -> isolated CODEX_HOME/auth.json
-   |
-   v
-chatgpt.com/backend-api
+   +------------------------------+
+                                  |
+Qwen Code / OpenAI-compatible     |
+local clients                     |
+   |                              |
+   | /v1 + local client-key       |
+   v                              v
+            127.0.0.1:8317
+                   |
+                   v
+          GPT Codex Router
+          |- local /v1 adapter
+          |- OAuth/profile broker
+          |- usage-limit failover
+          |- account-1 -> isolated CODEX_HOME/auth.json
+          |- account-2 -> isolated CODEX_HOME/auth.json
+          `- account-N -> isolated CODEX_HOME/auth.json
+                   |
+                   v
+          chatgpt.com/backend-api
 ```
 
 ## Quick start: Windows or macOS + Docker Desktop
@@ -83,10 +93,12 @@ account-2 -> official `codex login` -> browser ChatGPT sign-in
 When the final login is complete, setup automatically:
 
 1. writes the local profile registry;
-2. writes the host-state path to the ignored local `.env` used by Compose;
-3. builds and starts the Docker container;
-4. checks `http://127.0.0.1:8317/healthz`;
-5. backs up and configures `~/.codex/config.toml` (or `%USERPROFILE%\.codex\config.toml` on Windows).
+2. creates or reuses the router-local `/v1` `client-key`;
+3. records the installed Codex client version for `/v1/models`;
+4. writes the host-state path to the ignored local `.env` used by Compose;
+5. builds and starts the Docker container;
+6. checks `http://127.0.0.1:8317/healthz`;
+7. backs up and configures `~/.codex/config.toml` (or `%USERPROFILE%\.codex\config.toml` on Windows).
 
 Then **fully restart Codex Desktop**.
 
@@ -159,7 +171,17 @@ macOS:   ~/Library/Application Support/GPTCodexRouter
 
 Each Codex login is isolated below `profiles/codex/<profile>/auth.json`. Docker bind-mounts the platform state directory as `/data`, and the managed `profiles/` state path is excluded from the repository build context. Keep credential files in this managed state directory; do not copy standalone `auth.json` files into the source checkout.
 
-The setup script writes only the selected host-state path to the ignored repository-local `.env` file so ordinary `docker compose ...` commands use the same mount later. The `.env` file does not contain ChatGPT tokens.
+The state root also contains router-owned runtime files:
+
+```text
+registry.json             profile registry + active profile
+client-key                local bearer key for /v1/*
+codex-client-version      Codex version used for model-catalog compatibility
+observability/            JSONL lifecycle events and daily summaries
+profiles/codex/<profile>/ isolated Codex OAuth state
+```
+
+The setup script writes only the selected host-state path to the ignored repository-local `.env` file so ordinary `docker compose ...` commands use the same mount later. The `.env` file does not contain ChatGPT tokens or the local client key. Existing installations may deliberately point `.env` at a legacy/custom state root; do not delete, migrate, or rerun setup into a different root casually because the profile OAuth state and `client-key` live there.
 
 ### Codex Desktop config
 
@@ -180,7 +202,7 @@ For `/backend-api/codex/responses`, GPT Codex Router rejects only the Responses 
 
 ## OpenAI-compatible local API
 
-The same `127.0.0.1:8317` listener exposes a local OpenAI-compatible surface without changing the existing Codex Desktop routes:
+The same `127.0.0.1:8317` listener exposes an authenticated local compatibility surface for tools that speak OpenAI APIs:
 
 ```text
 POST /v1/responses
@@ -188,26 +210,28 @@ POST /v1/chat/completions
 GET  /v1/models
 ```
 
-`/v1/*` requires a router-local API key. This key is separate from the ChatGPT OAuth credentials and is stored next to the router state as `client-key`. Retrieve it from the running container with:
+Retrieve the router-local API key with:
 
 ```bash
 docker compose exec -T gpt-codex-router gpt-codex-router api-key
 ```
 
-Use these client settings:
+Use:
 
 ```text
 base URL: http://127.0.0.1:8317/v1
 API key:  <output of gpt-codex-router api-key>
 ```
 
-Clients that support the OpenAI Responses protocol should prefer `/v1/responses`. The local adapter accepts the OpenAI string `input` shorthand and converts it to Codex response items, forces the backend-required `store:false` and `stream:true`, and injects Codex-compatible `originator`/`version` headers. If the caller requested `stream:false` (or omitted `stream`), the adapter collects the Codex SSE stream and rebuilds the completed JSON response, including `response.output_item.done` items; `stream:true` callers receive the SSE stream directly. Explicit `store:true` is rejected because the ChatGPT Codex backend does not support that semantic.
+The key is stored as `<state-root>/client-key`, is separate from ChatGPT OAuth credentials, and is removed before requests enter the backend gateway. The selected Codex profile's OAuth credentials are injected later by the existing gateway.
 
-`/v1/chat/completions` is a compatibility adapter for clients that still require Chat Completions. It translates text messages, image URL content, function tools/tool calls, reasoning effort, max completion tokens, structured response formats, streaming deltas, and token usage. Its internal Responses request also always uses the backend-required `store:false` and `stream:true`; non-streaming Chat callers receive an assembled JSON completion. Unsupported Chat Completions fields are rejected with HTTP 400 instead of being silently discarded.
+`/v1/responses` is the primary compatibility path. The adapter normalizes the narrower ChatGPT Codex backend contract: string input becomes Codex response items, `store:false` and upstream `stream:true` are enforced, Qwen-style `max_output_tokens` is currently removed because the subscription backend rejects it, non-stream callers receive reconstructed completed JSON, and successful stream callers receive normalized SSE headers. Explicit `store:true` is rejected locally.
 
-`/v1/models` reads the Codex client version managed in router state (or recovers it from an existing Codex `models_cache.json`) and requests `/backend-api/codex/models?client_version=<version>`. Setup records the installed `codex --version` in `codex-client-version` so model discovery follows the same catalog contract as Codex itself.
+`/v1/chat/completions` translates a bounded Chat Completions subset to Responses and back. Unknown fields are rejected rather than silently ignored. Clients that can use Responses should prefer `/v1/responses`; in particular, current ChatGPT Codex backend behavior can reject `max_output_tokens` translated from Chat `max_completion_tokens`/`max_tokens`.
 
-The local client `Authorization` header is removed before the request enters the backend gateway. The gateway then injects only the selected ChatGPT/Codex profile credentials, so the local API key is never forwarded to ChatGPT.
+`/v1/models` uses the Codex client version stored in router state (or recovered from an existing Codex model cache) to request the Codex model catalog and normalize its identifiers.
+
+Qwen Code's `openai-responses` provider is a tested client path. For the one-file `~/.qwen/settings.json` configuration, router-specific key naming, model selection, and troubleshooting, see [`docs/qwen-code.md`](docs/qwen-code.md). For the exact endpoint/normalization contract, see [`docs/openai-compatible-api.md`](docs/openai-compatible-api.md).
 
 ## Codex compatibility
 
@@ -353,11 +377,14 @@ MIT. See [LICENSE](LICENSE).
 
 The router emits structured lifecycle events and distinguishes HTTP status from actual stream completion. For `/backend-api/codex/responses`, it also records **metadata-only Context Observability**: exact wire-body size, decoded context size, composition, bounded process-local opaque fingerprints, observed context reuse/growth, SSE event counts, and numeric token usage when ChatGPT supplies it. Codex may send the request body with `Content-Encoding: zstd`; the router decodes a bounded observer-only copy for analysis while forwarding and replaying the original compressed bytes unchanged. Prompt text, response text, source code, terminal/tool output contents, function arguments, and decoded payloads are not stored.
 
-Generate a recent report with:
+Generate a recent report from the normal Docker installation with:
 
 ```bash
-gpt-codex-router report --since 3h --timezone Asia/Seoul
+docker compose exec gpt-codex-router \
+  gpt-codex-router report --since 3h --timezone Asia/Seoul
 ```
+
+For a native development binary, run `gpt-codex-router report ...` directly.
 
 The report's `Context observability` section shows coverage, **request wire size**, **decoded context size**, context growth/reuse/amplification, structural composition, token usage, and replay inference. Stable lineage prefers explicit conversation/thread identifiers and can fall back to a process-local HMAC of `prompt_cache_key`; only the bounded lineage-source enum is logged, never the key itself. Composition separates tool outputs from tool definitions plus system, developer, reasoning, metadata, and residual other bytes. Growth/reuse/amplification are calculated from the decoded context representation rather than compressed wire bytes. `context_reuse_ratio` is structural payload reuse observed by the router; it is **not** the GPT prompt-cache hit rate. When upstream usage contains `cached_input_tokens`, the report shows the actual cached-token ratio separately. If upstream usage is absent, token usage is reported as `unavailable` rather than estimated from byte counts.
 

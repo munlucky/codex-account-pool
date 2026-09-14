@@ -17,7 +17,7 @@ Avoid speculative frameworks, compatibility layers, or unrelated provider integr
 
 ## Development
 
-Requires Go 1.23 or newer.
+Use a currently supported Go toolchain for development. As of September 2026, Go 1.26 or Go 1.27 is recommended; `go.mod` retains `go 1.23` as the module language version.
 
 ```bash
 make fmt
@@ -33,7 +33,11 @@ docker compose config
 docker build -t gpt-codex-router:dev .
 ```
 
-Automated tests must use synthetic credentials and local test servers. Never commit real `auth.json`, access tokens, refresh tokens, cookies, account IDs, or exported credentials.
+Automated tests must use synthetic credentials and local test servers. Never commit real `auth.json`, access tokens, refresh tokens, cookies, account IDs, router `client-key` values, or exported credentials.
+
+OpenAI-compatible adapter changes should include focused regression coverage for the affected contract. At minimum, preserve local bearer authentication, stripping of the local `Authorization` header before gateway injection, Codex-required `store:false`/upstream streaming behavior, bounded error responses, and SSE behavior for streaming clients. Qwen-shaped Responses requests are a primary interoperability case; do not add broad translation frameworks when one explicit compatibility rule is sufficient.
+
+When changing `/v1` behavior, update `README.md`, `docs/openai-compatible-api.md`, `docs/qwen-code.md` when applicable, and `SECURITY.md` if the trust boundary or credential handling changes.
 
 ## Pull requests
 

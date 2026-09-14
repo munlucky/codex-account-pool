@@ -21,7 +21,7 @@ Windows: %APPDATA%\GPTCodexRouter\profiles\codex\<profile>
 macOS:   ~/Library/Application Support/GPTCodexRouter/profiles/codex/<profile>
 ```
 
-The router reads the selected profile's Codex `auth.json` only to authenticate ChatGPT backend requests and maintain that same profile's OAuth refresh lifecycle. A separate router-local `client-key` is stored at the state root and is used only to authenticate `/v1/*` callers; it is never used as upstream ChatGPT authentication.
+The router reads the selected profile's Codex `auth.json` only to authenticate ChatGPT backend requests and maintain that same profile's OAuth refresh lifecycle. A separate router-local `client-key` is stored at the state root and is used only to authenticate `/v1/*` callers; it is never used as upstream ChatGPT authentication. The state root also stores `codex-client-version`, which is non-secret compatibility metadata used by `/v1/models`. Existing installations may point the repository-local Compose `.env` at a legacy/custom state root; treat that selected root as the credential boundary and do not silently migrate it.
 
 The project must never:
 
@@ -63,9 +63,13 @@ The local `GET /healthz` route is handled without reading profile credentials or
 
 The `/v1/*` surface is intended for local development clients only. It does not turn the router into a network service: the same loopback-only host boundary applies. The local client key is generated from cryptographically random bytes, stored outside the repository, and should be treated as a bearer secret.
 
-`/v1/responses` performs local authentication/path adaptation and injects router-controlled Codex compatibility headers before entering the existing gateway. Because the ChatGPT Codex backend requires item-list input, `store:false`, and `stream:true`, the adapter normalizes OpenAI string input, injects `store:false`, and always streams upstream. Non-streaming local callers receive a reconstructed completed JSON response assembled from the upstream SSE events. Explicit `store:true` is rejected rather than silently changing that caller-requested semantic. `/v1/chat/completions` translates a bounded supported subset into Responses requests and translates Responses output back to Chat Completions using the same backend-required `store:false`/`stream:true` contract. Unsupported request fields are rejected rather than silently discarded. `/v1/models` resolves the installed Codex client version from managed state (falling back to an existing Codex model cache), requests `/backend-api/codex/models?client_version=<version>`, and normalizes only the returned model identifiers. Caller-supplied `originator`, `version`, and `client_version` values are not trusted as the upstream Codex identity contract.
+`/v1/responses` performs local authentication/path adaptation and injects router-controlled Codex compatibility headers before entering the existing gateway. Because the ChatGPT Codex backend requires item-list input, `store:false`, and `stream:true`, the adapter normalizes OpenAI string input, injects `store:false`, and always streams upstream. Non-streaming local callers receive a reconstructed completed JSON response assembled from upstream SSE events. Successful streaming callers receive a normalized `Content-Type: text/event-stream` header even when the backend omits it. Explicit `store:true` is rejected rather than silently changing that caller-requested semantic. The adapter currently removes `max_output_tokens` because the subscription backend rejects that field and exposes no equivalent through this route; therefore the local adapter does not provide a hard upstream output-token cap for that field.
+
+`/v1/chat/completions` translates a bounded supported subset into Responses requests and translates Responses output back to Chat Completions using the same backend-required `store:false`/`stream:true` contract. Unsupported request fields are rejected rather than silently discarded. Chat `max_completion_tokens`/`max_tokens` currently map to Responses `max_output_tokens`, which the backend may reject; clients that support Responses should prefer `/v1/responses`. `/v1/models` resolves the installed Codex client version from managed state (falling back to an existing Codex model cache), requests `/backend-api/codex/models?client_version=<version>`, and normalizes only the returned model identifiers. Caller-supplied `originator`, `version`, and `client_version` values are not trusted as the upstream Codex identity contract.
 
 Do not publish the listener to a LAN or the public internet even when `/v1/*` authentication is enabled. The client key is defense in depth for local callers; it does not change the product's single-user trust model.
+
+If a client such as Qwen Code stores the router key directly in its own settings file, that settings file becomes local credential material. For example, Qwen's `settings.json` `env` object stores values in clear text. Do not commit, sync publicly, or attach such a file to bug reports. Prefer a router-specific variable name (for example `GPT_CODEX_ROUTER_API_KEY`) when multiple OpenAI-compatible tools share the machine so an unrelated `OPENAI_API_KEY` does not accidentally select the wrong credential.
 
 ## OAuth refresh lifecycle
 
@@ -102,7 +106,7 @@ The router returns HTTP 426 only for the `/backend-api/codex/responses` WebSocke
 
 ## Child-process environment
 
-Native CLI login/status/run operations use an isolated `CODEX_HOME` and remove known API-key/token override variables before launching Codex. both platform setup scripts apply the same isolation when invoking the official login command.
+Native CLI login/status/run operations use an isolated `CODEX_HOME` and remove known API-key/token override variables before launching Codex. Both platform setup scripts apply the same isolation when invoking the official login command.
 
 ## Context Observability data policy
 
@@ -134,7 +138,8 @@ Automated tests must use synthetic credentials and local test servers. Never com
 - cookies;
 - ChatGPT account IDs;
 - environment files containing credentials;
-- private proxy logs containing request data.
+- private proxy logs containing request data;
+- router `client-key` values or client settings files that embed that key.
 
 Managed runtime profile directories, common credential exports, environment files, `*.log` files, and build output are ignored by Git. A standalone file named `auth.json` outside the managed profile directory is credential material and must not be placed in the source checkout. Always inspect `git status` and the staged diff before publishing.
 
