@@ -10,6 +10,9 @@ services:
     environment:
       GPT_CODEX_ROUTER_HOME: /data
       GPT_CODEX_ROUTER_CONTAINER: "1"
+      GOOGLE_ANTIGRAVITY_CLIENT_ID: ${GOOGLE_ANTIGRAVITY_CLIENT_ID:-}
+      GOOGLE_ANTIGRAVITY_CLIENT_SECRET: ${GOOGLE_ANTIGRAVITY_CLIENT_SECRET:-}
+      GOOGLE_ANTIGRAVITY_USER_AGENT: ${GOOGLE_ANTIGRAVITY_USER_AGENT:-}
     volumes:
       - type: bind
         source: ${GPT_CODEX_ROUTER_STATE_ROOT:?run setup.cmd on Windows or ./setup.sh on macOS first}

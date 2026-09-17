@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	ProviderCodex   = "codex"
-	registryVersion = 1
+	ProviderCodex             = "codex"
+	ProviderGoogleAntigravity = "google-antigravity"
+	registryVersion           = 1
 )
 
 var profileIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
@@ -116,12 +117,20 @@ func (s *Store) Save(registry *Registry) error {
 	return nil
 }
 
+func (s *Store) ProfileHome(provider, profileID string) string {
+	return filepath.Join(s.root, "profiles", provider, profileID)
+}
+
+func (s *Store) ProfileAuthPath(provider, profileID string) string {
+	return filepath.Join(s.ProfileHome(provider, profileID), "auth.json")
+}
+
 func (s *Store) CodexHome(profileID string) string {
-	return filepath.Join(s.root, "profiles", ProviderCodex, profileID)
+	return s.ProfileHome(ProviderCodex, profileID)
 }
 
 func (s *Store) CodexAuthPath(profileID string) string {
-	return filepath.Join(s.CodexHome(profileID), "auth.json")
+	return s.ProfileAuthPath(ProviderCodex, profileID)
 }
 
 func (r *Registry) Add(profile Profile) error {
@@ -191,6 +200,10 @@ func ValidateProfile(p Profile) error {
 	case ProviderCodex:
 		if p.Isolation != "codex-home" {
 			return errors.New("codex profiles must use codex-home isolation")
+		}
+	case ProviderGoogleAntigravity:
+		if p.Isolation != "oauth-state" {
+			return errors.New("google-antigravity profiles must use oauth-state isolation")
 		}
 	default:
 		return fmt.Errorf("unsupported provider %q", p.Provider)

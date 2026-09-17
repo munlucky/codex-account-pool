@@ -1,12 +1,12 @@
 # OpenAI-compatible local API
 
-GPT Codex Router exposes a local OpenAI-compatible surface on the same loopback listener used by Codex Desktop.
+GPT Codex Router exposes a local OpenAI-compatible surface on the same loopback listener used by Codex Desktop:
 
 ```text
 http://127.0.0.1:8317/v1
 ```
 
-The compatibility surface is intentionally local-only and uses a router-local bearer key that is separate from all ChatGPT/Codex OAuth credentials.
+The compatibility surface is intentionally local-only and uses a router-local bearer key that is separate from every upstream OAuth credential.
 
 ## Endpoints
 
@@ -28,11 +28,24 @@ Retrieve the current key from the running container:
 docker compose exec -T gpt-codex-router gpt-codex-router api-key
 ```
 
-The key is created once under the configured router state root as `client-key` and is reused across ordinary container rebuilds/restarts. It changes only if that state is deliberately replaced or the key is deliberately rotated.
+The key is created once under the configured router state root as `client-key` and is reused across ordinary rebuilds/restarts. It is never reused as an upstream provider credential.
 
-The local bearer header is stripped before the request enters the ChatGPT backend gateway. The gateway injects only the OAuth credentials belonging to the selected Codex profile.
+## Provider routing
 
-## Request path
+`/backend-api/*` remains the native Codex data plane. Provider selection exists only on `/v1/*` and is deliberately model-prefix based:
+
+```text
+gpt-* / o* / any other bare model ID
+    -> Codex backend
+
+google-antigravity/<model>
+    -> Google Antigravity / Cloud Code Assist
+
+other-provider/<model>
+    -> 400 unsupported-provider error
+```
+
+A bare `gemini-*` ID is **not** inferred as Google Antigravity. This keeps routing explicit and prevents model-name collisions.
 
 ```text
 OpenAI-compatible client
@@ -41,41 +54,149 @@ OpenAI-compatible client
     v
 /v1/* adapter
     |- authenticate local caller
-    |- normalize client protocol where required
+    |- normalize to canonical Responses form
     |- strip local Authorization header
-    v
-/backend-api/codex/* gateway
-    |- choose active Codex profile
-    |- refresh that profile when required
-    |- perform narrow usage-limit failover when allowed
-    |- inject selected ChatGPT/Codex credentials
-    v
-chatgpt.com/backend-api/codex/*
+    |- resolve model provider
+    |
+    +--> Codex backend
+    |      -> existing /backend-api/codex/* gateway
+    |      -> selected Codex profile / Codex failover
+    |      -> chatgpt.com
+    |
+    `--> Google Antigravity backend
+           -> selected google-antigravity profile
+           -> Google OAuth refresh / project binding
+           -> Cloud Code Assist
 ```
 
-The existing Codex backend gateway remains authoritative for profile selection, OAuth refresh, retry/failover, and observability.
+The Codex gateway is not generalized into a provider framework. Antigravity has a separate credential broker and CCA adapter behind the `/v1` dispatcher.
+
+## Google Antigravity authentication
+
+Before login, configure `GOOGLE_ANTIGRAVITY_CLIENT_ID` and, when required by that OAuth client, `GOOGLE_ANTIGRAVITY_CLIENT_SECRET` in the ignored local `.env` file. Real OAuth client credentials are intentionally not embedded in the repository.
+
+Create the first Google profile interactively:
+
+```powershell
+docker compose exec -it gpt-codex-router `
+  gpt-codex-router auth add google-antigravity google-1
+```
+
+The login flow uses authorization code + PKCE. The default callback is:
+
+```text
+http://127.0.0.1:51121/callback
+```
+
+When the router runs natively, the loopback callback can complete automatically. In Docker mode the router does not start the container-local loopback callback because the host browser cannot reach it through the current Compose mapping. After Google redirects to `127.0.0.1:51121`, copy the **complete redirected URL** from the browser address bar and paste it into the CLI. A raw authorization code is also accepted for environments that expose it separately.
+
+After token exchange the router resolves the account's Cloud Code Assist project. The login is not committed as successful unless an access token, refresh token, expiry, and project binding are available. The project ID is stored only in that profile's private credential file, not in `registry.json`.
+
+Multiple Google profiles are supported:
+
+```powershell
+gpt-codex-router auth add google-antigravity google-2
+gpt-codex-router auth use google-antigravity google-2
+gpt-codex-router auth status google-antigravity google-2
+gpt-codex-router auth list
+```
+
+`auth list` and `auth status` do not print Google email, account IDs, project IDs, access tokens, or refresh tokens.
 
 ## `POST /v1/responses`
 
-This is the preferred API for clients that support the OpenAI Responses protocol, including Qwen Code's `openai-responses` provider.
+This is the preferred API for clients that support OpenAI Responses, including Qwen Code's `openai-responses` provider.
 
-The ChatGPT Codex subscription backend does not accept every field accepted by the public OpenAI Responses API. The local adapter therefore applies the smallest known compatibility normalization before forwarding the request.
+Common local rules:
 
-Current normalization:
+- JSON must contain a non-empty `model`;
+- string `input` is normalized to a user message with `input_text`;
+- `store:true` is rejected locally; `store:false` is accepted;
+- local `stream:false` is implemented by consuming canonical Responses SSE and assembling one completed Responses JSON object;
+- local `stream:true` returns canonical Responses SSE.
 
-- OpenAI string `input` is converted to a Codex message-item list using `input_text` content.
-- `store` is forced to `false`; explicit `store:true` is rejected locally with HTTP 400.
-- upstream `stream` is always forced to `true` because the Codex backend requires streaming;
-- when the local caller requested `stream:false` or omitted `stream`, the router consumes the upstream SSE stream and reconstructs one completed JSON Responses object;
-- when the local caller requested `stream:true`, the router forwards the SSE body and guarantees `Content-Type: text/event-stream` plus `Cache-Control: no-cache` on successful responses;
-- `max_output_tokens` is currently removed before forwarding because the Codex subscription backend rejects that parameter and exposes no equivalent field through this route;
-- router-controlled Codex compatibility headers such as `originator` and the detected Codex client `version` are injected locally.
+### Codex models
 
-The `max_output_tokens` behavior is an explicit compatibility trade-off: callers may send the field, but the router does **not** currently enforce that output limit upstream. Do not depend on it as a hard generation cap when using this subscription-backed route.
+Bare model IDs continue through the existing Codex adapter. It preserves the established subscription-backend compatibility behavior:
 
-The non-streaming aggregator reconstructs output from events including `response.output_item.done` and `response.completed`; it does not treat the initial HTTP 200 alone as generation completion.
+- upstream `store:false` and `stream:true` are enforced;
+- `max_output_tokens` is removed because the ChatGPT Codex subscription route rejects it;
+- router-controlled Codex `originator` and detected client-version headers are injected locally;
+- profile selection, refresh, and confirmed Codex usage-limit failover remain owned by the existing Codex gateway.
 
-### Example
+The `max_output_tokens` behavior is therefore a Codex-specific compatibility trade-off. Do not depend on it as a hard generation cap on that route.
+
+### Google Antigravity models
+
+An ID such as:
+
+```text
+google-antigravity/gemini-3.8-flash
+```
+
+is stripped to the provider model ID only after routing. The Antigravity adapter converts the Responses request into the Cloud Code Assist request envelope and supports the first implementation scope required for agent clients:
+
+- text user/assistant history;
+- system/developer instructions;
+- function tools;
+- function calls and function-call outputs;
+- `tool_choice`;
+- `temperature` and `top_p`;
+- `max_output_tokens`;
+- Responses reasoning effort to the provider's model-specific thinking controls;
+- stable process-local session IDs;
+- streaming text/function-call output;
+- usage metadata including reasoning tokens when supplied upstream.
+
+Image input is not part of the current Antigravity adapter contract and is rejected explicitly instead of being silently dropped.
+
+The upstream CCA stream is translated back to canonical Responses events such as:
+
+```text
+response.created
+response.output_item.added
+response.content_part.added
+response.output_text.delta
+response.function_call_arguments.delta
+response.output_item.done
+response.completed
+```
+
+Malformed or prematurely truncated CCA streams are not treated as completed generations.
+
+### Thought-signature continuity
+
+Provider reasoning/tool continuity uses a bounded process-memory replay cache. Its key includes Google profile, wire model, session, function name, and canonical arguments. Only signatures that match the provider signature shape are retained; synthetic OpenAI item/call IDs are rejected as signatures.
+
+Properties:
+
+```text
+memory only
+bounded entry count
+TTL + LRU eviction
+profile isolated
+no raw prompt storage
+cleared on process exit
+```
+
+A signature-related upstream 400 clears that session's cached signature state rather than recycling it across later turns.
+
+### 401 and 429 behavior
+
+Antigravity authentication failures and quota responses intentionally use different rules:
+
+```text
+401
+ -> refresh the same profile once
+ -> retry the same profile once
+ -> otherwise require login again
+```
+
+A generic 429 is **not** an account-rotation signal. Before any alternate profile is tried, the router probes `fetchAvailableModels` with the failed profile's own access-token/project pair and requires the exact wire model to report zero remaining quota. It then requires another registered profile's same wire model to report positive remaining quota. Only then is the original request replayed once with that alternate profile's token and project as one credential snapshot. Unknown, missing, or still-positive quota evidence returns the original 429 without rotation.
+
+## Example Responses calls
+
+Codex:
 
 ```bash
 KEY="$(docker compose exec -T gpt-codex-router gpt-codex-router api-key)"
@@ -86,12 +207,21 @@ curl http://127.0.0.1:8317/v1/responses \
   -d '{"model":"gpt-5.6-luna","input":"Reply with exactly: pong","stream":false}'
 ```
 
-On PowerShell:
+Antigravity:
+
+```bash
+curl http://127.0.0.1:8317/v1/responses \
+  -H "Authorization: Bearer ${KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"google-antigravity/gemini-3.8-flash","input":"Reply with exactly: pong","stream":false}'
+```
+
+PowerShell:
 
 ```powershell
 $key = (docker compose exec -T gpt-codex-router gpt-codex-router api-key).Trim()
 $body = @{
-  model = "gpt-5.6-luna"
+  model = "google-antigravity/gemini-3.8-flash"
   input = "Reply with exactly: pong"
   stream = $false
 } | ConvertTo-Json
@@ -104,78 +234,81 @@ curl.exe http://127.0.0.1:8317/v1/responses `
 
 ## `POST /v1/chat/completions`
 
-The Chat Completions endpoint is a compatibility adapter for clients that cannot use Responses directly.
+Chat Completions is a compatibility adapter for clients that cannot use Responses directly. It translates the supported Chat request into canonical Responses first and then uses the same provider router. There is no separate Antigravity Chat transport.
 
-It translates the supported Chat Completions subset into one upstream Responses request and translates the result back to Chat Completions JSON/SSE.
+The existing Chat translator supports text messages, function tools/calls, `tool_choice`, streaming usage, temperature/top-p, reasoning effort, response-format translation, and token-limit translation. Some Chat features can translate to Responses items that a specific backend does not support; backend-specific validation still applies. In particular, Antigravity image input is currently rejected.
 
-Supported request families include:
-
-- text messages;
-- image URL content;
-- function tools and function calls;
-- `tool_choice` and `parallel_tool_calls`;
-- streaming and `stream_options.include_usage`;
-- `temperature` and `top_p`;
-- `reasoning_effort`;
-- text / JSON-object / JSON-schema response formats;
-- `max_completion_tokens` / `max_tokens` translation.
-
-Unknown Chat Completions fields are rejected with HTTP 400 instead of being silently discarded. The `user` field is currently accepted by the request parser for compatibility but is not forwarded to the Codex backend; do not rely on it for attribution or routing.
-
-Important backend caveat: `max_completion_tokens` and `max_tokens` are translated to Responses `max_output_tokens`. The current ChatGPT Codex subscription backend may reject that field. Clients that can use Responses should prefer `/v1/responses`, where the router has a dedicated compatibility rule for this mismatch.
+Unknown Chat Completions fields are rejected with HTTP 400 rather than silently discarded.
 
 ## `GET /v1/models`
 
-The model endpoint reads the Codex client version from managed router state and requests the same Codex model-catalog route used by the compatibility layer:
+The model endpoint merges independently obtained provider catalogs.
+
+Codex models come from:
 
 ```text
 /backend-api/codex/models?client_version=<detected-version>
 ```
 
-Setup writes the installed `codex --version` value to:
+using the managed `codex-client-version` metadata or an existing Codex model cache fallback.
+
+Antigravity models are discovered lazily with:
 
 ```text
-<state-root>/codex-client-version
+POST /v1internal:fetchAvailableModels
 ```
 
-If that file is missing, the router can recover a version from an existing Codex `models_cache.json`. If no usable version can be resolved, `/v1/models` returns a local configuration error while the rest of the router can continue serving traffic.
+The discovery call happens on model-list demand, not server startup. It uses a short timeout, caches successful results in memory, collapses provider wire variants into stable public picker IDs where required, and falls back to a bounded static Antigravity catalog when live discovery is unavailable. A catalog failure from one provider does not suppress models obtained from the other provider.
 
-Example:
+Antigravity entries are always namespaced:
 
-```bash
-KEY="$(docker compose exec -T gpt-codex-router gpt-codex-router api-key)"
-curl http://127.0.0.1:8317/v1/models -H "Authorization: Bearer ${KEY}"
+```json
+{
+  "id": "google-antigravity/gemini-3.8-flash",
+  "object": "model",
+  "owned_by": "google-antigravity"
+}
 ```
 
-The returned identifiers are normalized into an OpenAI-style model list. A model appearing in the list means it is visible through the current Codex catalog contract; it does not override subscription eligibility or upstream product policy.
+A model appearing in the list is a routing/catalog statement, not a guarantee that the current subscription/profile is entitled to use it.
+
+## Server startup without a profile
+
+The HTTP server no longer requires an active Codex profile before listening. This allows health checks and Antigravity-only local `/v1` use:
+
+```text
+/healthz                         -> available when the router is healthy
+/backend-api/* without Codex    -> Codex auth unavailable
+Antigravity model without login -> provider-not-configured error
+```
+
+Live model discovery is never a startup dependency.
 
 ## Error behavior
 
 Local compatibility errors use JSON error objects. Common cases include:
 
-- `401 invalid_api_key`: the bearer key does not match the current router `client-key`;
-- `400 invalid_request_error`: malformed JSON, `store:true`, or an unsupported Chat Completions request shape;
-- `503 configuration_error`: model listing cannot resolve a Codex client version;
-- upstream 4xx/5xx: returned through the same backend gateway after local authentication and normalization.
-
-Do not expose raw upstream HTML challenge pages or credential material to clients. `/v1/models` converts upstream catalog failures into bounded JSON errors.
+- `401 invalid_api_key`: the bearer key does not match the router `client-key`;
+- `400 invalid_request_error`: malformed JSON, `store:true`, unsupported request shape, or unsupported provider prefix;
+- `503 provider_not_configured`: the requested provider has no usable active login;
+- bounded upstream 4xx/5xx errors: no raw provider body, token, project ID, or HTML challenge page is reflected to the caller.
 
 ## Observability
 
-Compatibility traffic uses the same request lifecycle logger as native Codex traffic. `api_surface` distinguishes the local client entry point:
+Compatibility traffic uses the same structured lifecycle sink. Important dimensions include:
 
 ```text
-openai_responses
-openai_chat_completions
-openai_models
+api_surface = openai_responses | openai_chat_completions | openai_models
+provider    = google-antigravity   (for Antigravity lifecycle events)
+route_template = /backend-api/... or /v1internal:streamGenerateContent
 ```
 
-`route_template` still records the backend route actually used, for example `/backend-api/codex/responses`.
+Codex Context Observability remains attached to the Codex Responses data plane. Antigravity currently records lifecycle/upstream timing and status metadata without persisting raw prompt/response bodies, tool arguments, thought signatures, OAuth values, Google account identity, or project IDs.
 
-For `/v1/responses` and `/v1/chat/completions`, Context Observability sees the normalized/transcoded Responses payload that is actually sent to the backend, not the caller's original local request body. See [`observability.md`](observability.md).
+See [`observability.md`](observability.md).
 
 ## Security boundary
 
-The `/v1` key authenticates only local callers to the router. It is not an OpenAI API key and is never sent to ChatGPT.
+The `/v1` key authenticates only local callers to the router. It is not an OpenAI or Google API key and is never sent upstream. Provider access/refresh tokens are loaded from the selected local profile and injected by the corresponding broker after local authentication.
 
 The listener must remain host-loopback-only. The presence of a local bearer key does not make the service appropriate for LAN, internet, or multi-user exposure. See [`../SECURITY.md`](../SECURITY.md).

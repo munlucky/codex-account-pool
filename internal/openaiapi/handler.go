@@ -3,6 +3,7 @@ package openaiapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,23 +11,28 @@ import (
 	"strings"
 
 	"github.com/munlucky/codex-account-pool/internal/clientauth"
-	"github.com/munlucky/codex-account-pool/internal/gateway"
 )
 
 type Handler struct {
-	backend       http.Handler
-	apiKey        string
-	clientVersion string
+	router *ProviderRouter
+	apiKey string
 }
 
 func New(backend http.Handler, apiKey, clientVersion string) (*Handler, error) {
 	if backend == nil {
 		return nil, fmt.Errorf("backend handler is required")
 	}
+	return NewWithRouter(&ProviderRouter{Codex: NewCodexBackend(backend, clientVersion)}, apiKey)
+}
+
+func NewWithRouter(router *ProviderRouter, apiKey string) (*Handler, error) {
+	if router == nil {
+		return nil, fmt.Errorf("provider router is required")
+	}
 	if strings.TrimSpace(apiKey) == "" {
 		return nil, fmt.Errorf("client API key is required")
 	}
-	return &Handler{backend: backend, apiKey: apiKey, clientVersion: strings.TrimSpace(clientVersion)}, nil
+	return &Handler{router: router, apiKey: apiKey}, nil
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -59,23 +65,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) forwardResponses(w http.ResponseWriter, r *http.Request) {
-	clone := h.cloneCodexRequest(r, "/backend-api/codex/responses", "openai_responses")
-	requestedStream, err := normalizeResponsesRequest(clone)
+	payload, requestedStream, err := readResponsesPayload(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
+	model, _ := payload["model"].(string)
+	backend, upstreamModel, err := h.router.Resolve(model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "Could not encode normalized request.")
+		return
+	}
+	clone := r.Clone(withBackendSurface(r.Context(), "openai_responses"))
+	clone.Header = r.Header.Clone()
+	clone.Header.Del("Authorization")
+	resetRequestBody(clone, body)
 	clone.Header.Set("Content-Type", "application/json")
 	clone.Header.Del("Content-Encoding")
 	clone.Header.Del("Accept-Encoding")
 
 	if requestedStream {
-		h.backend.ServeHTTP(&responsesSSEWriter{ResponseWriter: w}, clone)
+		backend.ServeResponses(&responsesSSEWriter{ResponseWriter: w}, clone, upstreamModel)
 		return
 	}
 
 	capture := newCaptureWriter()
-	h.backend.ServeHTTP(capture, clone)
+	backend.ServeResponses(capture, clone, upstreamModel)
 	if capture.status >= 400 {
 		copyCaptured(w, capture)
 		return
@@ -121,67 +141,57 @@ func (w *responsesSSEWriter) Flush() {
 	}
 }
 
-func normalizeResponsesRequest(r *http.Request) (bool, error) {
-	body, err := io.ReadAll(r.Body)
+func readResponsesPayload(r *http.Request) (map[string]any, bool, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 	if err != nil {
-		return false, fmt.Errorf("read request body: %w", err)
+		return nil, false, fmt.Errorf("read request body: %w", err)
 	}
 
-	var payload map[string]json.RawMessage
+	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return false, fmt.Errorf("request body must be valid JSON: %w", err)
+		return nil, false, fmt.Errorf("request body must be valid JSON: %w", err)
+	}
+	if payload == nil {
+		return nil, false, fmt.Errorf("request body must be a JSON object")
 	}
 
 	if store, ok := payload["store"]; ok {
-		var enabled bool
-		if err := json.Unmarshal(store, &enabled); err != nil {
-			return false, fmt.Errorf("store must be a boolean")
+		enabled, ok := store.(bool)
+		if !ok {
+			return nil, false, fmt.Errorf("store must be a boolean")
 		}
 		if enabled {
-			return false, fmt.Errorf("store=true is not supported by the ChatGPT Codex backend")
+			return nil, false, fmt.Errorf("store=true is not supported by the local router")
 		}
 	}
-	payload["store"] = json.RawMessage("false")
+	payload["store"] = false
 
 	requestedStream := false
 	if stream, ok := payload["stream"]; ok {
-		if err := json.Unmarshal(stream, &requestedStream); err != nil {
-			return false, fmt.Errorf("stream must be a boolean")
+		value, ok := stream.(bool)
+		if !ok {
+			return nil, false, fmt.Errorf("stream must be a boolean")
 		}
-	}
-	// The ChatGPT Codex backend requires streaming. For non-streaming local
-	// callers we aggregate the completed SSE response back into JSON.
-	payload["stream"] = json.RawMessage("true")
-
-	// Qwen Code's OpenAI Responses provider always emits max_output_tokens,
-	// while the ChatGPT Codex subscription backend rejects that parameter.
-	// There is currently no equivalent Codex backend field, so omit it.
-	delete(payload, "max_output_tokens")
-
-	if input, ok := payload["input"]; ok {
-		var text string
-		if err := json.Unmarshal(input, &text); err == nil {
-			normalized, err := json.Marshal([]any{map[string]any{
-				"type": "message",
-				"role": "user",
-				"content": []any{map[string]any{
-					"type": "input_text",
-					"text": text,
-				}},
-			}})
-			if err != nil {
-				return false, fmt.Errorf("normalize input: %w", err)
-			}
-			payload["input"] = normalized
-		}
+		requestedStream = value
 	}
 
-	body, err = json.Marshal(payload)
-	if err != nil {
-		return false, fmt.Errorf("encode normalized request: %w", err)
+	model, ok := payload["model"].(string)
+	if !ok || strings.TrimSpace(model) == "" {
+		return nil, false, fmt.Errorf("model is required")
 	}
-	resetRequestBody(r, body)
-	return requestedStream, nil
+	payload["model"] = strings.TrimSpace(model)
+
+	if input, ok := payload["input"].(string); ok {
+		payload["input"] = []any{map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{map[string]any{
+				"type": "input_text",
+				"text": input,
+			}},
+		}}
+	}
+	return payload, requestedStream, nil
 }
 
 func completedResponsesPayload(body []byte, contentType string) (map[string]any, error) {
@@ -203,50 +213,21 @@ func resetRequestBody(r *http.Request, body []byte) {
 }
 
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
-	if h.clientVersion == "" {
-		writeError(w, http.StatusServiceUnavailable, "configuration_error", "Codex client version is unavailable. Rerun setup or start Codex once before listing models.")
+	models, err := h.router.Models(r.Context())
+	if err != nil {
+		var providerErr *providerError
+		if errors.As(err, &providerErr) {
+			message := "Provider model catalog request failed."
+			if providerErr.typ == "configuration_error" {
+				message = "Codex client version is unavailable. Rerun setup or start Codex once before listing models."
+			}
+			writeError(w, providerErr.status, providerErr.typ, message)
+			return
+		}
+		writeError(w, http.StatusBadGateway, "upstream_error", "No provider model catalog is currently available.")
 		return
 	}
-	clone := h.cloneCodexRequest(r, "/backend-api/codex/models", "openai_models")
-	query := clone.URL.Query()
-	query.Set("client_version", h.clientVersion)
-	clone.URL.RawQuery = query.Encode()
-	clone.Header.Del("Accept-Encoding")
-	capture := newCaptureWriter()
-	h.backend.ServeHTTP(capture, clone)
-	if capture.status >= 400 {
-		writeError(w, capture.status, "upstream_error", fmt.Sprintf("Codex model catalog returned HTTP %d.", capture.status))
-		return
-	}
-	ids := collectModelIDs(capture.body.Bytes())
-	if len(ids) == 0 {
-		writeError(w, http.StatusBadGateway, "upstream_error", "Codex model catalog returned an invalid response.")
-		return
-	}
-	data := make([]map[string]any, 0, len(ids))
-	for _, id := range ids {
-		data = append(data, map[string]any{"id": id, "object": "model", "owned_by": "chatgpt-codex"})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
-}
-
-func (h *Handler) cloneCodexRequest(r *http.Request, path, surface string) *http.Request {
-	clone := cloneRequest(r, path, surface)
-	clone.Header.Set("originator", "codex_cli_rs")
-	if h.clientVersion != "" {
-		clone.Header.Set("version", h.clientVersion)
-	}
-	return clone
-}
-
-func cloneRequest(r *http.Request, path, surface string) *http.Request {
-	ctx := gateway.WithAPISurface(r.Context(), surface)
-	clone := r.Clone(ctx)
-	clone.URL.Path = path
-	clone.URL.RawPath = ""
-	clone.Header = r.Header.Clone()
-	clone.Header.Del("Authorization")
-	return clone
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
 }
 
 type captureWriter struct {

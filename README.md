@@ -1,8 +1,8 @@
 # GPT Codex Router
 
-Local, Docker-first ChatGPT authentication routing for Codex Desktop, Codex CLI, and OpenAI-compatible local LLM clients.
+Local, Docker-first subscription/OAuth routing for Codex Desktop, Codex CLI, Google Antigravity, and OpenAI-compatible local LLM clients.
 
-GPT Codex Router lets you sign in to multiple ChatGPT accounts through the **official Codex login flow**, keeps each account in an isolated `CODEX_HOME`, and routes Codex backend traffic through the selected profile. The same local service also exposes authenticated OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and `/v1/models` endpoints. When ChatGPT returns a confirmed subscription usage-limit response, the router can move to the next registered profile and replay that request.
+GPT Codex Router lets you sign in to multiple ChatGPT accounts through the **official Codex login flow**, keeps each account in an isolated `CODEX_HOME`, and preserves the existing Codex `/backend-api/*` data plane. The authenticated `/v1/responses`, `/v1/chat/completions`, and `/v1/models` surface can additionally route explicitly prefixed `google-antigravity/<model>` requests through an isolated Google OAuth profile and Cloud Code Assist adapter. Codex quota failover behavior remains separate from Antigravity routing.
 
 > **Unofficial project.** This repository is not affiliated with or endorsed by OpenAI. OpenAI, ChatGPT, GPT, and Codex names are used only to describe interoperability. Use only accounts you are authorized to use and follow the applicable product terms and limits.
 
@@ -169,16 +169,17 @@ Windows: %APPDATA%\GPTCodexRouter
 macOS:   ~/Library/Application Support/GPTCodexRouter
 ```
 
-Each Codex login is isolated below `profiles/codex/<profile>/auth.json`. Docker bind-mounts the platform state directory as `/data`, and the managed `profiles/` state path is excluded from the repository build context. Keep credential files in this managed state directory; do not copy standalone `auth.json` files into the source checkout.
+Each Codex login is isolated below `profiles/codex/<profile>/auth.json`. Google Antigravity credentials are independently isolated below `profiles/google-antigravity/<profile>/auth.json`; those files contain the Google access/refresh lifecycle and the Cloud Code Assist project binding for that same profile. Docker bind-mounts the platform state directory as `/data`, and the managed `profiles/` state path is excluded from the repository build context. Keep credential files in this managed state directory; do not copy standalone `auth.json` files into the source checkout.
 
 The state root also contains router-owned runtime files:
 
 ```text
-registry.json             profile registry + active profile
-client-key                local bearer key for /v1/*
-codex-client-version      Codex version used for model-catalog compatibility
-observability/            JSONL lifecycle events and daily summaries
-profiles/codex/<profile>/ isolated Codex OAuth state
+registry.json                              provider profiles + active profile per provider
+client-key                                 local bearer key for /v1/*
+codex-client-version                       Codex version used for model-catalog compatibility
+observability/                             JSONL lifecycle events and daily summaries
+profiles/codex/<profile>/                  isolated Codex OAuth state
+profiles/google-antigravity/<profile>/     isolated Google Antigravity OAuth/project state
 ```
 
 The setup script writes only the selected host-state path to the ignored repository-local `.env` file so ordinary `docker compose ...` commands use the same mount later. The `.env` file does not contain ChatGPT tokens or the local client key. Existing installations may deliberately point `.env` at a legacy/custom state root; do not delete, migrate, or rerun setup into a different root casually because the profile OAuth state and `client-key` live there.
@@ -223,15 +224,48 @@ base URL: http://127.0.0.1:8317/v1
 API key:  <output of gpt-codex-router api-key>
 ```
 
-The key is stored as `<state-root>/client-key`, is separate from ChatGPT OAuth credentials, and is removed before requests enter the backend gateway. The selected Codex profile's OAuth credentials are injected later by the existing gateway.
+The key is stored as `<state-root>/client-key`, is separate from every upstream OAuth credential, and is removed before provider dispatch. `/backend-api/*` remains Codex-only. `/v1/*` chooses a provider from the requested model ID:
 
-`/v1/responses` is the primary compatibility path. The adapter normalizes the narrower ChatGPT Codex backend contract: string input becomes Codex response items, `store:false` and upstream `stream:true` are enforced, Qwen-style `max_output_tokens` is currently removed because the subscription backend rejects it, non-stream callers receive reconstructed completed JSON, and successful stream callers receive normalized SSE headers. Explicit `store:true` is rejected locally.
+```text
+gpt-* / o* / other bare model IDs  -> existing Codex backend
+google-antigravity/<model>         -> Google Antigravity / Cloud Code Assist
+other-provider/<model>              -> explicit unsupported-provider error
+```
 
-`/v1/chat/completions` translates a bounded Chat Completions subset to Responses and back. Unknown fields are rejected rather than silently ignored. Clients that can use Responses should prefer `/v1/responses`; in particular, current ChatGPT Codex backend behavior can reject `max_output_tokens` translated from Chat `max_completion_tokens`/`max_tokens`.
+Bare `gemini-*` IDs are **not** inferred as Antigravity. The explicit prefix prevents provider-name collisions as additional providers are added later.
 
-`/v1/models` uses the Codex client version stored in router state (or recovered from an existing Codex model cache) to request the Codex model catalog and normalize its identifiers.
+`/v1/responses` is the primary compatibility path. For Codex models, the existing compatibility rules remain unchanged: string input becomes response items, `store:false` and upstream `stream:true` are enforced, Qwen-style `max_output_tokens` is removed because the subscription backend rejects it, non-stream callers receive reconstructed completed JSON, and successful stream callers receive normalized SSE headers. For `google-antigravity/*`, the adapter translates Responses messages, instructions, function tools, tool calls/results, reasoning controls, streaming output, token usage, and provider thought signatures into and out of Cloud Code Assist while still exposing canonical Responses SSE locally. Explicit `store:true` is rejected locally.
 
-Qwen Code's `openai-responses` provider is a tested client path. For the one-file `~/.qwen/settings.json` configuration, router-specific key naming, model selection, and troubleshooting, see [`docs/qwen-code.md`](docs/qwen-code.md). For the exact endpoint/normalization contract, see [`docs/openai-compatible-api.md`](docs/openai-compatible-api.md).
+`/v1/chat/completions` first translates the supported Chat Completions subset to the same canonical Responses request and then uses the same provider router, so Antigravity does not have a separate Chat-only transport.
+
+`/v1/models` merges the Codex model catalog with a lazily discovered Antigravity catalog. Antigravity discovery has a bounded timeout and in-memory cache; startup never waits on it, and a bounded static catalog is used when live discovery is unavailable. Antigravity IDs are exposed only as `google-antigravity/<model>`.
+
+### Google Antigravity login
+
+The Google provider is optional. Add its first profile from the running container:
+
+```powershell
+docker compose exec -it gpt-codex-router `
+  gpt-codex-router auth add google-antigravity google-1
+```
+
+The command prints the Google authorization URL. In a native run, the `127.0.0.1:51121` callback can complete automatically. In Docker mode the router intentionally disables the unreachable container-loopback callback and uses manual completion: after Google redirects to `127.0.0.1:51121`, copy the complete redirected URL from the browser address bar and paste it back into the CLI. The authorization code, access token, refresh token, account identity, and project ID are never printed by `auth list` or `auth status`.
+
+Additional accounts and manual selection use the same provider-scoped commands:
+
+```powershell
+docker compose exec -it gpt-codex-router gpt-codex-router auth add google-antigravity google-2
+docker compose exec -T  gpt-codex-router gpt-codex-router auth use google-antigravity google-2
+docker compose exec -T  gpt-codex-router gpt-codex-router auth list
+```
+
+A 401 refreshes the **same** Google profile once before requiring login again. A generic 429 does not rotate accounts. The router only performs one alternate-profile replay when the failed profile's exact wire-model quota is positively observed as exhausted and another profile's same-model quota is positively observed as usable; token and Cloud Code Assist project bindings are switched as one credential snapshot.
+
+Google Antigravity OAuth client credentials are intentionally not embedded in the repository. Set `GOOGLE_ANTIGRAVITY_CLIENT_ID` and, when required by that OAuth client, `GOOGLE_ANTIGRAVITY_CLIENT_SECRET` in the ignored local `.env` file before login. Compose passes them into the container without writing them into registry state.
+
+For credentialed end-to-end verification, including manual Docker callback completion, Responses streaming, two-turn function-call/signature replay, and Qwen Code, see [`docs/google-antigravity-live-test.md`](docs/google-antigravity-live-test.md).
+
+Qwen Code's `openai-responses` provider is a tested Codex client path and uses the same local `/v1` surface for Antigravity model selection. For the one-file `~/.qwen/settings.json` configuration, router-specific key naming, model selection, and troubleshooting, see [`docs/qwen-code.md`](docs/qwen-code.md). For the exact endpoint/normalization contract, see [`docs/openai-compatible-api.md`](docs/openai-compatible-api.md).
 
 ## Codex compatibility
 

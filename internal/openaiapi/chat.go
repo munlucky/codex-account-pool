@@ -76,7 +76,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
-	clone := h.cloneCodexRequest(r, "/backend-api/codex/responses", "openai_chat_completions")
+	backend, upstreamModel, err := h.router.Resolve(req.Model)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	clone := r.Clone(withBackendSurface(r.Context(), "openai_chat_completions"))
+	clone.Header = r.Header.Clone()
+	clone.Header.Del("Authorization")
 	clone.Body = io.NopCloser(bytes.NewReader(responsesBody))
 	clone.ContentLength = int64(len(responsesBody))
 	clone.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(responsesBody)), nil }
@@ -86,12 +93,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	if req.Stream {
 		sw := newChatStreamWriter(w, req.Model, req.StreamOptions != nil && req.StreamOptions.IncludeUsage)
-		h.backend.ServeHTTP(sw, clone)
+		backend.ServeResponses(sw, clone, upstreamModel)
 		sw.finish()
 		return
 	}
 	capture := newCaptureWriter()
-	h.backend.ServeHTTP(capture, clone)
+	backend.ServeResponses(capture, clone, upstreamModel)
 	if capture.status >= 400 {
 		copyCaptured(w, capture)
 		return

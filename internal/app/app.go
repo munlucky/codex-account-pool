@@ -14,6 +14,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/munlucky/codex-account-pool/internal/antigravity"
+	"github.com/munlucky/codex-account-pool/internal/antigravityauth"
 	"github.com/munlucky/codex-account-pool/internal/authbroker"
 	"github.com/munlucky/codex-account-pool/internal/clientauth"
 	"github.com/munlucky/codex-account-pool/internal/codexmeta"
@@ -28,15 +30,20 @@ var ErrUsage = errors.New("invalid command usage")
 
 const defaultListenAddress = "127.0.0.1:8317"
 
+type antigravityLogin interface {
+	Login(context.Context, string, io.Reader, io.Writer, bool) error
+}
+
 type App struct {
-	Store    *profile.Store
-	Executor process.Executor
-	In       io.Reader
-	Out      io.Writer
-	Err      io.Writer
-	CodexBin string
-	Version  string
-	Commit   string
+	Store           *profile.Store
+	Executor        process.Executor
+	In              io.Reader
+	Out             io.Writer
+	Err             io.Writer
+	CodexBin        string
+	Version         string
+	Commit          string
+	AntigravityAuth antigravityLogin
 }
 
 func New(store *profile.Store, executor process.Executor, out, errOut io.Writer, version string) *App {
@@ -82,30 +89,36 @@ func (a *App) executeAuth(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("%w: auth requires add, login, list, use, or status", ErrUsage)
 	}
+	supported := func(provider string) bool {
+		return provider == profile.ProviderCodex || provider == profile.ProviderGoogleAntigravity
+	}
 	switch args[0] {
 	case "add":
-		if len(args) != 3 || args[1] != profile.ProviderCodex {
-			return fmt.Errorf("%w: usage: auth add codex <profile>", ErrUsage)
+		if len(args) != 3 || !supported(args[1]) {
+			return fmt.Errorf("%w: usage: auth add <codex|google-antigravity> <profile>", ErrUsage)
 		}
 		return a.authAdd(ctx, args[1], args[2])
 	case "login":
-		if len(args) != 3 || args[1] != profile.ProviderCodex {
-			return fmt.Errorf("%w: usage: auth login codex <profile>", ErrUsage)
+		if len(args) != 3 || !supported(args[1]) {
+			return fmt.Errorf("%w: usage: auth login <codex|google-antigravity> <profile>", ErrUsage)
 		}
-		return a.authLoginCodex(ctx, args[2])
+		if args[1] == profile.ProviderCodex {
+			return a.authLoginCodex(ctx, args[2])
+		}
+		return a.authLoginAntigravity(ctx, args[2])
 	case "list":
 		if len(args) != 1 {
 			return fmt.Errorf("%w: usage: auth list", ErrUsage)
 		}
 		return a.authList()
 	case "use":
-		if len(args) != 3 || args[1] != profile.ProviderCodex {
-			return fmt.Errorf("%w: usage: auth use codex <profile>", ErrUsage)
+		if len(args) != 3 || !supported(args[1]) {
+			return fmt.Errorf("%w: usage: auth use <codex|google-antigravity> <profile>", ErrUsage)
 		}
 		return a.authUse(args[1], args[2])
 	case "status":
-		if len(args) < 2 || len(args) > 3 || args[1] != profile.ProviderCodex {
-			return fmt.Errorf("%w: usage: auth status codex [profile]", ErrUsage)
+		if len(args) < 2 || len(args) > 3 || !supported(args[1]) {
+			return fmt.Errorf("%w: usage: auth status <codex|google-antigravity> [profile]", ErrUsage)
 		}
 		requestedID := ""
 		if len(args) == 3 {
@@ -140,6 +153,14 @@ func (a *App) authAdd(ctx context.Context, provider, id string) error {
 		if err := a.Executor.Run(ctx, codexCommand(a.CodexBin, home, []string{"login"})); err != nil {
 			return err
 		}
+	case profile.ProviderGoogleAntigravity:
+		home := a.Store.ProfileHome(provider, id)
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			return fmt.Errorf("create google-antigravity profile home: %w", err)
+		}
+		if err := a.antigravityAuthenticator().Login(ctx, id, a.In, a.Out, true); err != nil {
+			return err
+		}
 	}
 
 	if err := registry.Add(p); err != nil {
@@ -148,7 +169,7 @@ func (a *App) authAdd(ctx context.Context, provider, id string) error {
 	if err := a.Store.Save(registry); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.Out, "Registered %s/%s. GPT Codex Router Auth Broker will use the official Codex OAuth state in this isolated profile.\n", provider, id)
+	fmt.Fprintf(a.Out, "Registered %s/%s. Provider credentials remain isolated under the router profile home.\n", provider, id)
 	return nil
 }
 
@@ -166,6 +187,24 @@ func (a *App) authLoginCodex(ctx context.Context, id string) error {
 	}
 	fmt.Fprintf(a.Out, "Refreshing official Codex ChatGPT login for profile %q.\n", id)
 	return a.Executor.Run(ctx, codexCommand(a.CodexBin, home, []string{"login"}))
+}
+
+func (a *App) authLoginAntigravity(ctx context.Context, id string) error {
+	registry, err := a.Store.Load()
+	if err != nil {
+		return err
+	}
+	if _, ok := registry.Find(profile.ProviderGoogleAntigravity, id); !ok {
+		return fmt.Errorf("profile google-antigravity/%s not found", id)
+	}
+	return a.antigravityAuthenticator().Login(ctx, id, a.In, a.Out, false)
+}
+
+func (a *App) antigravityAuthenticator() antigravityLogin {
+	if a.AntigravityAuth != nil {
+		return a.AntigravityAuth
+	}
+	return antigravityauth.NewAuthenticatorForStore(antigravityauth.NewStore(a.Store))
 }
 
 func (a *App) authList() error {
@@ -199,6 +238,8 @@ func (a *App) authUse(provider, id string) error {
 	fmt.Fprintf(a.Out, "Active %s profile: %s\n", provider, id)
 	if provider == profile.ProviderCodex {
 		fmt.Fprintln(a.Out, "The gateway will use this profile for the next new backend request. A confirmed Codex usage-limit response may fail over automatically to another registered profile.")
+	} else if provider == profile.ProviderGoogleAntigravity {
+		fmt.Fprintln(a.Out, "The /v1 provider router will use this Google Antigravity profile for new requests. Generic 429s do not rotate accounts; one alternate-profile replay is allowed only after exact wire-model quota exhaustion is positively verified.")
 	}
 	return nil
 }
@@ -212,8 +253,19 @@ func (a *App) authStatus(ctx context.Context, provider, requestedID string) erro
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(a.Out, "Codex ChatGPT profile %s (CODEX_HOME=%s)\n", p.ID, a.Store.CodexHome(p.ID))
-	return a.Executor.Run(ctx, codexCommand(a.CodexBin, a.Store.CodexHome(p.ID), []string{"login", "status"}))
+	if provider == profile.ProviderCodex {
+		fmt.Fprintf(a.Out, "Codex ChatGPT profile %s (CODEX_HOME=%s)\n", p.ID, a.Store.CodexHome(p.ID))
+		return a.Executor.Run(ctx, codexCommand(a.CodexBin, a.Store.CodexHome(p.ID), []string{"login", "status"}))
+	}
+	credential, err := antigravityauth.NewStore(a.Store).Load(p.ID)
+	if err != nil {
+		return err
+	}
+	if credential.AccessToken == "" || credential.RefreshToken == "" || credential.ProjectID == "" {
+		return fmt.Errorf("google-antigravity profile %s requires login", p.ID)
+	}
+	fmt.Fprintf(a.Out, "Google Antigravity profile %s: authenticated\n", p.ID)
+	return nil
 }
 
 type runOptions struct {
@@ -288,9 +340,6 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 		return err
 	}
 	broker := authbroker.New(a.Store)
-	if _, err := broker.ValidateActive(); err != nil {
-		return err
-	}
 	upstream, _ := url.Parse("https://chatgpt.com")
 	handler, err := gateway.New(broker, upstream)
 	if err != nil {
@@ -316,7 +365,14 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 	} else if err := codexmeta.PersistClientVersion(a.Store.Root(), clientVersion); err != nil {
 		fmt.Fprintf(a.Err, "warning: could not persist Codex client version: %v\n", err)
 	}
-	openAIHandler, err := openaiapi.New(handler, clientKey, clientVersion)
+	antigravityBroker := antigravityauth.NewBroker(a.Store)
+	antigravityBackend := antigravity.New(antigravityBroker)
+	antigravityBackend.SetRequestLogger(logger.Emit)
+	providerRouter := &openaiapi.ProviderRouter{
+		Codex:       openaiapi.NewCodexBackend(handler, clientVersion),
+		Antigravity: antigravityBackend,
+	}
+	openAIHandler, err := openaiapi.NewWithRouter(providerRouter, clientKey)
 	if err != nil {
 		return err
 	}
@@ -394,10 +450,16 @@ func serverHandler(backend, openAI http.Handler) http.Handler {
 }
 
 func newProfile(provider, id string) (profile.Profile, error) {
-	if provider != profile.ProviderCodex {
+	isolation := ""
+	switch provider {
+	case profile.ProviderCodex:
+		isolation = "codex-home"
+	case profile.ProviderGoogleAntigravity:
+		isolation = "oauth-state"
+	default:
 		return profile.Profile{}, fmt.Errorf("unsupported provider %q", provider)
 	}
-	p := profile.Profile{ID: id, Provider: provider, Isolation: "codex-home"}
+	p := profile.Profile{ID: id, Provider: provider, Isolation: isolation}
 	if err := profile.ValidateProfile(p); err != nil {
 		return profile.Profile{}, err
 	}
@@ -438,9 +500,11 @@ func (a *App) printUsage() {
 Usage:
   gpt-codex-router auth add codex <profile>
   gpt-codex-router auth login codex <profile>
+  gpt-codex-router auth add google-antigravity <profile>
+  gpt-codex-router auth login google-antigravity <profile>
   gpt-codex-router auth list
-  gpt-codex-router auth use codex <profile>
-  gpt-codex-router auth status codex [profile]
+  gpt-codex-router auth use <codex|google-antigravity> <profile>
+  gpt-codex-router auth status <codex|google-antigravity> [profile]
   gpt-codex-router serve [--listen 127.0.0.1:8317]
   gpt-codex-router api-key
   gpt-codex-router report [--since 3h] [--timezone Asia/Seoul] [--file <jsonl>|--stdin]
@@ -450,6 +514,7 @@ Usage:
 OpenAI-compatible API:
   base_url = "http://127.0.0.1:8317/v1"
   api_key  = output of gpt-codex-router api-key
+  model    = gpt-* for Codex, or google-antigravity/<model> for Google Antigravity
 
 Codex Desktop setup:
   chatgpt_base_url = "http://127.0.0.1:8317/backend-api"

@@ -42,6 +42,7 @@ type Event struct {
 	Method            string    `json:"method,omitempty"`
 	RouteTemplate     string    `json:"route_template,omitempty"`
 	APISurface        string    `json:"api_surface,omitempty"`
+	Provider          string    `json:"provider,omitempty"`
 	Transport         string    `json:"transport,omitempty"`
 	PeerClass         string    `json:"peer_class,omitempty"`
 	ProfileRef        string    `json:"profile_ref,omitempty"`
