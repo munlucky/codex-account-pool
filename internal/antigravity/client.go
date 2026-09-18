@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/munlucky/codex-account-pool/internal/accountpool"
 	"github.com/munlucky/codex-account-pool/internal/antigravityauth"
 	"github.com/munlucky/codex-account-pool/internal/observability"
 	"github.com/munlucky/codex-account-pool/internal/openaiapi"
@@ -35,6 +36,7 @@ type cachedCatalog struct {
 
 type Client struct {
 	Broker    CredentialProvider
+	Pool      *accountpool.Pool
 	HTTP      *http.Client
 	BaseURL   string
 	UserAgent string
@@ -51,12 +53,14 @@ func New(broker CredentialProvider) *Client {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	return &Client{
-		Broker: broker, HTTP: httpClient, BaseURL: defaultBaseURL, UserAgent: antigravityauth.UserAgent(), Replay: NewReplayCache(0, 0), Now: time.Now,
+		Broker: broker, Pool: accountpool.New(0, 0), HTTP: httpClient, BaseURL: defaultBaseURL, UserAgent: antigravityauth.UserAgent(), Replay: NewReplayCache(0, 0), Now: time.Now,
 		catalog: make(map[string]cachedCatalog),
 	}
 }
 
 func (c *Client) SetRequestLogger(logger func(observability.Event)) { c.Logger = logger }
+
+func (c *Client) SupportsAccountSelector() bool { return true }
 
 func (c *Client) ServeResponses(w http.ResponseWriter, r *http.Request, upstreamModel string) {
 	requestID := "ag_" + randomHex(10)
@@ -73,13 +77,24 @@ func (c *Client) ServeResponses(w http.ResponseWriter, r *http.Request, upstream
 		c.end(requestID, surface, started, http.StatusBadRequest, "local", observability.OutcomeLocalResponse, observability.SemanticFailed)
 		return
 	}
-	credentials, err := c.Broker.Credentials(r.Context())
+	wireModel, _ := resolveWireModel(upstreamModel, reasoningEffort(payload))
+	session, sessionErr := c.resolveSession(r, payload, wireModel)
+	if sessionErr != nil || session == "" {
+		writeAPIError(w, 503, "session_continuity_unavailable", "Conversation identity or tool replay has expired; start a new conversation.")
+		c.end(requestID, surface, started, 503, "local", observability.OutcomeLocalResponse, observability.SemanticFailed)
+		return
+	}
+	lease, credentials, err := c.acquireAccount(r.Context(), session, wireModel, openaiapi.RequestRoute(r).AccountSelector, hasToolHistory(payload))
 	if err != nil {
-		writeAPIError(w, http.StatusServiceUnavailable, "provider_not_configured", "Google Antigravity login is required. Run `gpt-codex-router auth add google-antigravity <profile>`. ")
+		category := "account_unavailable"
+		if errors.Is(err, accountpool.ErrContinuity) {
+			category = "session_continuity_unavailable"
+		}
+		writeAPIError(w, http.StatusServiceUnavailable, category, "Google Antigravity account or session is unavailable; check login and conversation identity.")
 		c.end(requestID, surface, started, http.StatusServiceUnavailable, "local", observability.OutcomeLocalResponse, observability.SemanticFailed)
 		return
 	}
-	session := sessionID(r, payload)
+	defer lease.policy.Release()
 	prepared, err := prepareRequest(payload, upstreamModel, session, credentials.ProfileID, c.replay())
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -115,36 +130,19 @@ func (c *Client) ServeResponses(w http.ResponseWriter, r *http.Request, upstream
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		if pool, ok := c.Broker.(failoverCredentialProvider); ok {
-			probeCtx, cancel := quotaProbeContext(r.Context())
-			currentQuota := c.probeModelQuota(probeCtx, credentials, prepared.WireModel)
-			cancel()
-			if currentQuota == quotaExhausted {
-				candidates := pool.CandidateCredentials(r.Context(), credentials.ProfileID)
-				for _, candidate := range candidates {
-					probeCtx, cancel := quotaProbeContext(r.Context())
-					candidateQuota := c.probeModelQuota(probeCtx, candidate, prepared.WireModel)
-					cancel()
-					if candidateQuota != quotaUsable {
-						continue
-					}
-					candidatePrepared, prepareErr := prepareRequest(payload, upstreamModel, session, candidate.ProfileID, c.replay())
-					if prepareErr != nil {
-						continue
-					}
-					drainAndClose(resp.Body)
-					credentials = candidate
-					prepared = candidatePrepared
-					attempt++
-					resp, elapsed, err = c.sendInference(r.Context(), credentials, prepared)
-					if err != nil {
-						writeAPIError(w, http.StatusBadGateway, "upstream_error", "Google Antigravity failover request failed.")
-						c.end(requestID, surface, started, http.StatusBadGateway, "local", observability.OutcomeLocalResponse, observability.SemanticFailed)
-						return
-					}
-					c.emit(observability.Event{Timestamp: c.now(), SchemaVersion: observability.SchemaVersion, EventType: observability.EventUpstreamAttempt, RequestID: requestID, RouteTemplate: "/v1internal:streamGenerateContent", APISurface: surface, Provider: "google-antigravity", Transport: "http", Attempt: attempt, StatusCode: resp.StatusCode, StatusOrigin: "upstream", UpstreamHeadersMS: float64(elapsed.Microseconds()) / 1000})
-					break
+		if candidate, ok := lease.failover(r.Context(), credentials, prepared.WireModel, c.probeModelQuota); ok {
+			candidatePrepared, prepareErr := prepareRequest(payload, upstreamModel, session, candidate.ProfileID, c.replay())
+			if prepareErr == nil {
+				drainAndClose(resp.Body)
+				credentials, prepared = candidate, candidatePrepared
+				attempt++
+				resp, elapsed, err = c.sendInference(r.Context(), credentials, prepared)
+				if err != nil {
+					writeAPIError(w, http.StatusBadGateway, "upstream_error", "Google Antigravity failover request failed.")
+					c.end(requestID, surface, started, http.StatusBadGateway, "local", observability.OutcomeLocalResponse, observability.SemanticFailed)
+					return
 				}
+				c.emit(observability.Event{Timestamp: c.now(), SchemaVersion: observability.SchemaVersion, EventType: observability.EventUpstreamAttempt, RequestID: requestID, RouteTemplate: "/v1internal:streamGenerateContent", APISurface: surface, Provider: "google-antigravity", Transport: "http", Attempt: attempt, StatusCode: resp.StatusCode, StatusOrigin: "upstream", UpstreamHeadersMS: float64(elapsed.Microseconds()) / 1000})
 			}
 		}
 	}
@@ -158,15 +156,22 @@ func (c *Client) ServeResponses(w http.ResponseWriter, r *http.Request, upstream
 		if status < 400 || status > 599 {
 			status = http.StatusBadGateway
 		}
-		message := fmt.Sprintf("Google Antigravity upstream returned HTTP %d.", resp.StatusCode)
+		category := "upstream_error"
+		if resp.StatusCode == 400 && strings.Contains(hint, "signature") {
+			category = "invalid_tool_signature"
+		} else if resp.StatusCode == 400 && (strings.Contains(hint, "schema") || strings.Contains(hint, "function_declarations")) {
+			category = "invalid_tool_schema"
+		}
+		message := fmt.Sprintf("Google Antigravity upstream returned HTTP %d (%s).", resp.StatusCode, category)
 		if resp.StatusCode == http.StatusUnauthorized {
 			message = "Google Antigravity authentication was rejected. Re-run the provider login command."
 		}
-		writeAPIError(w, status, "upstream_error", message)
+		writeAPIError(w, status, category, message)
 		c.end(requestID, surface, started, status, "upstream", observability.OutcomeBodyEOF, observability.SemanticFailed)
 		return
 	}
 
+	lease.policy.ObserveSuccess(credentials.ProfileID)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)

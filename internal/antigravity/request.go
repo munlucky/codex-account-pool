@@ -50,6 +50,7 @@ func responsesInputToGemini(raw any, profileID, model, session string, replay *R
 	contents := make([]any, 0, len(input))
 	systemText := ""
 	callNames := map[string]string{}
+	callWireIDs := map[string]string{}
 	for _, rawItem := range input {
 		item, ok := rawItem.(map[string]any)
 		if !ok {
@@ -91,9 +92,22 @@ func responsesInputToGemini(raw any, profileID, model, session string, replay *R
 				}
 			}
 			callNames[callID] = name
-			part := map[string]any{"functionCall": map[string]any{"id": callID, "name": name, "args": args}}
-			if signature, ok := replay.Lookup(profileID, model, session, name, args); ok {
+			wireID := callID
+			signature, found := replay.Lookup(profileID, model, session, name, args)
+			if strings.HasPrefix(callID, "call_ag_") {
+				record, ok := replay.LookupCall(callID, model, name, args)
+				if !ok || record.profile != profileID || record.session != session {
+					return nil, "", fmt.Errorf("session_continuity_unavailable: invalid or expired tool call")
+				}
+				wireID, signature = record.wireID, record.signature
+				found = signature != ""
+			}
+			callWireIDs[callID] = wireID
+			part := map[string]any{"functionCall": map[string]any{"id": wireID, "name": name, "args": args}}
+			if found {
 				part["thoughtSignature"] = signature
+			} else if strings.Contains(strings.ToLower(model), "gemini") {
+				return nil, "", fmt.Errorf("session_continuity_unavailable: tool signature expired or conversation identity changed")
 			}
 			contents = append(contents, map[string]any{"role": "model", "parts": []any{part}})
 		case "function_call_output":
@@ -103,10 +117,10 @@ func responsesInputToGemini(raw any, profileID, model, session string, replay *R
 			}
 			name := callNames[callID]
 			if name == "" {
-				name = "tool"
+				return nil, "", fmt.Errorf("function_call_output requires matching function_call history")
 			}
 			response := map[string]any{"result": item["output"]}
-			part := map[string]any{"functionResponse": map[string]any{"id": callID, "name": name, "response": response}}
+			part := map[string]any{"functionResponse": map[string]any{"id": callWireIDs[callID], "name": name, "response": response}}
 			contents = append(contents, map[string]any{"role": "user", "parts": []any{part}})
 		default:
 			return nil, "", fmt.Errorf("unsupported Responses input item type %q", typ)
@@ -171,7 +185,11 @@ func translateTools(raw any) (any, error) {
 			declaration["description"] = description
 		}
 		if parameters := tool["parameters"]; parameters != nil {
-			declaration["parameters"] = parameters
+			converted, err := transformGoogleSchema(parameters)
+			if err != nil {
+				return nil, fmt.Errorf("invalid_tool_schema: %w", err)
+			}
+			declaration["parameters"] = converted
 		}
 		declarations = append(declarations, declaration)
 	}

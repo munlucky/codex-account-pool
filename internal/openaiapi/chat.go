@@ -3,6 +3,7 @@ package openaiapi
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -76,14 +77,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "invalid_request_error", err.Error())
 		return
 	}
-	backend, upstreamModel, err := h.router.Resolve(req.Model)
+	backend, target, err := h.router.ResolveTarget(req.Model, r.Header.Get(AccountSelectorHeader))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	clone := r.Clone(withBackendSurface(r.Context(), "openai_chat_completions"))
+	clone := r.Clone(context.WithValue(withBackendSurface(r.Context(), "openai_chat_completions"), routeKey{}, target))
 	clone.Header = r.Header.Clone()
 	clone.Header.Del("Authorization")
+	clone.Header.Del(AccountSelectorHeader)
 	clone.Body = io.NopCloser(bytes.NewReader(responsesBody))
 	clone.ContentLength = int64(len(responsesBody))
 	clone.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(responsesBody)), nil }
@@ -93,12 +95,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	if req.Stream {
 		sw := newChatStreamWriter(w, req.Model, req.StreamOptions != nil && req.StreamOptions.IncludeUsage)
-		backend.ServeResponses(sw, clone, upstreamModel)
+		backend.ServeResponses(sw, clone, target.Model)
 		sw.finish()
 		return
 	}
 	capture := newCaptureWriter()
-	backend.ServeResponses(capture, clone, upstreamModel)
+	backend.ServeResponses(capture, clone, target.Model)
 	if capture.status >= 400 {
 		copyCaptured(w, capture)
 		return

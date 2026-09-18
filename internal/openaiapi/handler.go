@@ -2,6 +2,7 @@ package openaiapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,7 +23,7 @@ func New(backend http.Handler, apiKey, clientVersion string) (*Handler, error) {
 	if backend == nil {
 		return nil, fmt.Errorf("backend handler is required")
 	}
-	return NewWithRouter(&ProviderRouter{Codex: NewCodexBackend(backend, clientVersion)}, apiKey)
+	return NewWithRouter(&ProviderRouter{Default: "codex", Providers: map[string]ResponsesBackend{"codex": NewCodexBackend(backend, clientVersion)}}, apiKey)
 }
 
 func NewWithRouter(router *ProviderRouter, apiKey string) (*Handler, error) {
@@ -71,7 +72,7 @@ func (h *Handler) forwardResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	model, _ := payload["model"].(string)
-	backend, upstreamModel, err := h.router.Resolve(model)
+	backend, target, err := h.router.ResolveTarget(model, r.Header.Get(AccountSelectorHeader))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -81,21 +82,22 @@ func (h *Handler) forwardResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "Could not encode normalized request.")
 		return
 	}
-	clone := r.Clone(withBackendSurface(r.Context(), "openai_responses"))
+	clone := r.Clone(context.WithValue(withBackendSurface(r.Context(), "openai_responses"), routeKey{}, target))
 	clone.Header = r.Header.Clone()
 	clone.Header.Del("Authorization")
+	clone.Header.Del(AccountSelectorHeader)
 	resetRequestBody(clone, body)
 	clone.Header.Set("Content-Type", "application/json")
 	clone.Header.Del("Content-Encoding")
 	clone.Header.Del("Accept-Encoding")
 
 	if requestedStream {
-		backend.ServeResponses(&responsesSSEWriter{ResponseWriter: w}, clone, upstreamModel)
+		backend.ServeResponses(&responsesSSEWriter{ResponseWriter: w}, clone, target.Model)
 		return
 	}
 
 	capture := newCaptureWriter()
-	backend.ServeResponses(capture, clone, upstreamModel)
+	backend.ServeResponses(capture, clone, target.Model)
 	if capture.status >= 400 {
 		copyCaptured(w, capture)
 		return

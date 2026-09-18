@@ -263,6 +263,8 @@ A 401 refreshes the **same** Google profile once before requiring login again. A
 
 Google Antigravity OAuth client credentials are intentionally not embedded in the repository. Set `GOOGLE_ANTIGRAVITY_CLIENT_ID` and, when required by that OAuth client, `GOOGLE_ANTIGRAVITY_CLIENT_SECRET` in the ignored local `.env` file before login. Compose passes them into the container without writing them into registry state.
 
+Antigravity conversations keep their selected account across turns and verified quota failover. `auth use` sets the preference for new conversations. Tool clients can echo the router-issued opaque `call_id` for continuity without extra headers; explicit conversation IDs also preserve affinity across plain-text turns. `X-AI-Account` selects an exact Antigravity profile and disables failover. See [account continuity and schema policy](docs/openai-compatible-api.md#account-and-thought-signature-continuity) and the [structural change record](docs/account-pool-architecture.md).
+
 For credentialed end-to-end verification, including manual Docker callback completion, Responses streaming, two-turn function-call/signature replay, and Qwen Code, see [`docs/google-antigravity-live-test.md`](docs/google-antigravity-live-test.md).
 
 Qwen Code's `openai-responses` provider is a tested Codex client path and uses the same local `/v1` surface for Antigravity model selection. For the one-file `~/.qwen/settings.json` configuration, router-specific key naming, model selection, and troubleshooting, see [`docs/qwen-code.md`](docs/qwen-code.md). For the exact endpoint/normalization contract, see [`docs/openai-compatible-api.md`](docs/openai-compatible-api.md).

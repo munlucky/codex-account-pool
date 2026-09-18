@@ -314,3 +314,63 @@ func TestClientDoesNotFailOverWhen429QuotaStillUsable(t *testing.T) {
 		t.Fatalf("stream attempts=%d", streamAttempts)
 	}
 }
+
+func TestTranslateToolsSanitizesUnsupportedSchemaFields(t *testing.T) {
+	raw := []any{
+		map[string]any{
+			"type":        "function",
+			"name":        "search",
+			"description": "search tool",
+			"parameters": map[string]any{
+				"$schema": "http://json-schema.org/draft-07/schema#",
+				"$id":     "search-schema",
+				"$defs":   map[string]any{"text": map[string]any{"type": "string"}},
+				"type":    "object",
+				"properties": map[string]any{
+					"query": map[string]any{
+						"type": "string",
+						"$ref": "#/$defs/text",
+					},
+					"tags": map[string]any{
+						"type":        "array",
+						"uniqueItems": true,
+						"items": map[string]any{
+							"type": "string",
+						},
+					},
+				},
+				"required": []any{"query"},
+			},
+		},
+	}
+	result, err := translateTools(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools, ok := result.([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("unexpected tools result: %v", result)
+	}
+	toolMap := tools[0].(map[string]any)
+	decls := toolMap["functionDeclarations"].([]any)
+	decl := decls[0].(map[string]any)
+	params := decl["parameters"].(map[string]any)
+	if _, ok := params["$schema"]; ok {
+		t.Errorf("expected $schema to be removed")
+	}
+	if _, ok := params["$id"]; ok {
+		t.Errorf("expected $id to be removed")
+	}
+	props := params["properties"].(map[string]any)
+	queryProp := props["query"].(map[string]any)
+	if _, ok := queryProp["$ref"]; ok {
+		t.Errorf("expected $ref to be removed")
+	}
+	tagsProp := props["tags"].(map[string]any)
+	if _, ok := tagsProp["uniqueItems"]; ok {
+		t.Errorf("expected uniqueItems to be removed")
+	}
+	if tagsProp["type"] != "array" {
+		t.Errorf("expected tags type=array, got %v", tagsProp["type"])
+	}
+}

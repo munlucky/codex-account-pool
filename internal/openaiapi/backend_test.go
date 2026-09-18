@@ -2,6 +2,7 @@ package openaiapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 )
@@ -13,10 +14,37 @@ func (s *stubResponsesBackend) Models(context.Context) ([]Model, error) {
 	return append([]Model(nil), s.models...), nil
 }
 
+type brokenBackend struct{ stubResponsesBackend }
+
+func (*brokenBackend) Models(context.Context) ([]Model, error) {
+	return nil, errors.New("catalog unavailable")
+}
+
+func TestRegistrySupportsAnotherProviderWithoutRouterChanges(t *testing.T) {
+	other := &stubResponsesBackend{models: []Model{{ID: "native"}}}
+	r := &ProviderRouter{Default: "codex", Providers: map[string]ResponsesBackend{"codex": &brokenBackend{}, "another": other}}
+	b, target, err := r.ResolveTarget("another/native", "")
+	if err != nil || b != other || target.Provider != "another" || target.Model != "native" {
+		t.Fatal(target, err)
+	}
+	models, err := r.Models(context.Background())
+	if err != nil || len(models) != 1 || models[0].ID != "another/native" {
+		t.Fatal(models, err)
+	}
+	for _, model := range []string{"", "another/", "another/native/extra", "/native", "unknown/native"} {
+		if _, _, err := r.ResolveTarget(model, ""); err == nil {
+			t.Fatal("accepted", model)
+		}
+	}
+	if _, _, err := r.ResolveTarget("another/native", "profile"); err == nil {
+		t.Fatal("unsupported selector silently ignored")
+	}
+}
+
 func TestProviderRouterUsesExplicitAntigravityPrefixOnly(t *testing.T) {
 	codex := &stubResponsesBackend{}
 	google := &stubResponsesBackend{}
-	router := &ProviderRouter{Codex: codex, Antigravity: google}
+	router := &ProviderRouter{Providers: map[string]ResponsesBackend{"codex": codex, "google-antigravity": google}}
 
 	backend, model, err := router.Resolve("google-antigravity/gemini-3.8-flash")
 	if err != nil || backend != google || model != "gemini-3.8-flash" {
@@ -33,8 +61,10 @@ func TestProviderRouterUsesExplicitAntigravityPrefixOnly(t *testing.T) {
 
 func TestProviderRouterMergesAndPrefixesModels(t *testing.T) {
 	router := &ProviderRouter{
-		Codex:       &stubResponsesBackend{models: []Model{{ID: "gpt-test", Object: "model", OwnedBy: "chatgpt-codex"}}},
-		Antigravity: &stubResponsesBackend{models: []Model{{ID: "gemini-test"}}},
+		Providers: map[string]ResponsesBackend{
+			"codex":              &stubResponsesBackend{models: []Model{{ID: "gpt-test", Object: "model", OwnedBy: "chatgpt-codex"}}},
+			"google-antigravity": &stubResponsesBackend{models: []Model{{ID: "gemini-test"}}},
+		},
 	}
 	models, err := router.Models(context.Background())
 	if err != nil {

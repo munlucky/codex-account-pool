@@ -1,5 +1,9 @@
 # Qwen Code integration
 
+For `google-antigravity/*`, Qwen must echo the router-returned opaque `call_id` with the unchanged function name and arguments. The router recovers the original conversation/account even when Qwen sends no conversation header. It never groups conversations by their first prompt text. After router restart or cache expiry, start a new conversation if `session_continuity_unavailable` is returned.
+
+Clients may supply a unique `X-Client-Thread-Id` per conversation to retain account affinity across plain-text turns as well. Do not hardcode one shared ID for concurrent sessions. The local regression suite covers headerless Responses tool continuation, Chat translation, account changes, and signature restoration with a fake upstream; it is not a fresh credentialed Qwen/Google live test.
+
 Qwen Code can use GPT Codex Router through its `openai-responses` provider.
 
 This path has been validated against the router with Qwen Code 0.23.3 on Windows using a ChatGPT/Codex profile and `gpt-5.6-luna`.
@@ -263,4 +267,3 @@ Qwen Code's current configuration reference documents `modelProviders`, the `ope
 - [Qwen Code authentication configuration](https://github.com/QwenLM/qwen-code/blob/main/docs/users/configuration/auth.md)
 
 The router documentation describes the compatibility behavior implemented in this repository; Qwen's upstream documentation remains authoritative for future Qwen configuration changes.
-

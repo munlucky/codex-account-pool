@@ -146,6 +146,7 @@ $key = (docker compose exec -T gpt-codex-router `
 
 $headers = @{
   Authorization = "Bearer $key"
+  "X-Client-Thread-Id" = [guid]::NewGuid().ToString()
 }
 ```
 
@@ -324,7 +325,7 @@ $call | Format-List
 
 ### 7-2. 두 번째 턴: function result replay
 
-첫 사용자 메시지를 동일하게 포함해야 fallback session anchor가 유지된다.
+첫/두 번째 요청에 같은 `$headers`의 `X-Client-Thread-Id`를 사용한다. 첫 사용자 문장만으로 세션을 추정하지 않는다. 헤더 없는 클라이언트는 라우터 응답의 불투명한 `call_id`를 그대로 돌려보내면 원래 세션을 복원한다.
 
 ```powershell
 $secondInput = @(
@@ -562,7 +563,8 @@ docker compose exec -it gpt-codex-router `
 7번 테스트의 첫/두 번째 요청에서:
 
 - 같은 model을 사용했는지,
-- 첫 user message를 동일하게 유지했는지,
+- 같은 `X-Client-Thread-Id`를 유지했거나 라우터가 반환한 `call_id`를 그대로 사용했는지,
+- 라우터 재시작이나 replay TTL 만료가 없었는지,
 - 첫 response의 `call_id`, `name`, `arguments`를 바꾸지 않았는지 확인한다.
 
 그 조건이 맞는데도 재현되면 Antigravity signature replay 결함으로 취급한다.

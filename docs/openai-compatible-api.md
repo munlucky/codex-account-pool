@@ -64,7 +64,8 @@ OpenAI-compatible client
     |      -> chatgpt.com
     |
     `--> Google Antigravity backend
-           -> selected google-antigravity profile
+           -> session-affine account pool
+           -> selected google-antigravity credential snapshot
            -> Google OAuth refresh / project binding
            -> Cloud Code Assist
 ```
@@ -100,6 +101,8 @@ gpt-codex-router auth use google-antigravity google-2
 gpt-codex-router auth status google-antigravity google-2
 gpt-codex-router auth list
 ```
+
+For Antigravity, `auth use` changes the preferred account for new conversations. Existing in-memory bindings retain their account, including an account selected by verified failover.
 
 `auth list` and `auth status` do not print Google email, account IDs, project IDs, access tokens, or refresh tokens.
 
@@ -164,7 +167,17 @@ response.completed
 
 Malformed or prematurely truncated CCA streams are not treated as completed generations.
 
-### Thought-signature continuity
+### Account and thought-signature continuity
+
+Account selection lives in a credential-free pool, separate from the HTTP adapter. Every request reloads one selected profile's current token/project snapshot. Requests in the same conversation serialize through the end of the stream; other conversations remain independent. The pool holds at most 1024 conversations, with 30-minute idle expiry and idle-entry eviction. It never evicts an in-flight lease.
+
+Use a unique conversation identifier in `X-Client-Thread-Id`, `X-OpenAI-Conversation-Id`, or `X-Codex-Parent-Thread-Id`. A Responses `prompt_cache_key` can also identify a conversation, but must be unique per conversation, not shared merely because prompts use the same cache template. Explicit headers take precedence over `prompt_cache_key`.
+
+Headerless clients receive opaque router-generated `call_id` values. Echo each returned `call_id`, function name, and arguments unchanged in subsequent tool history. A bounded in-memory registry recovers the original conversation and restores the provider's original wire call ID and signature. Identical initial prompts in different conversations do not share identity. Headerless requests without tool history are independent requests; use an explicit identifier to preserve account affinity across plain-text turns.
+
+The cache holds up to 1024 signature entries and 1024 call handles, expiring after 30 minutes. Handles bind the function name and canonical argument digest. Invalid, expired, mixed-session, or altered handles fail locally. Restart, expiry, or eviction can make tool continuation unavailable. Start a new conversation when `session_continuity_unavailable` is returned; the router does not invent signatures or replay them under another account.
+
+For an exact Antigravity profile, send `X-AI-Account: google-2`. The local header is removed before dispatch and never sent upstream. Unknown or wrong-provider profiles fail without fallback. A selector conflicting with existing tool history fails continuity validation. A pinned request never fails over. Codex rejects this unsupported header; its existing gateway behavior remains unchanged.
 
 Provider reasoning/tool continuity uses a bounded process-memory replay cache. Its key includes Google profile, wire model, session, function name, and canonical arguments. Only signatures that match the provider signature shape are retained; synthetic OpenAI item/call IDs are rejected as signatures.
 
@@ -179,7 +192,15 @@ no raw prompt storage
 cleared on process exit
 ```
 
-A signature-related upstream 400 clears that session's cached signature state rather than recycling it across later turns.
+A signature-related upstream 400 clears that session's signature and call-handle state rather than recycling it across later turns.
+
+### Google tool schema transformation
+
+Function `parameters` are transformed without mutating the caller's schema. Local `$ref` pointers through `$defs` or `definitions` are inlined, including escaped JSON Pointer segments. String `const` becomes a singleton string `enum`; conflicting type/enum constraints fail locally. Object properties retain their literal names, including `$ref` and `uniqueItems`.
+
+`$schema`, `$id`, unused definitions, `default`, and `examples` are removed. `uniqueItems` is deliberately omitted for wire compatibility; tool executors must enforce uniqueness. Objects, arrays, supported scalar types, nullable unions, `anyOf`, boolean/schema `additionalProperties`, string enums, bounds, required fields, and supported annotations are retained. Non-string enum/const, general type unions, unsupported composition/keywords, unresolved/external/cyclic references, and conflicting reference siblings return local `400 invalid_request_error` with `invalid_tool_schema` in the message.
+
+Expansion is limited to depth 32, 4096 schema nodes, and 256 KiB of transformed JSON. These are adapter limits, not guarantees that an upstream model accepts every schema. The subset follows the [Google Schema representation](https://googleapis.github.io/dotnet-genai/api/Google.GenAI.Types.Schema.html); the Antigravity transport still has its own upstream acceptance behavior.
 
 ### 401 and 429 behavior
 
@@ -193,6 +214,8 @@ Antigravity authentication failures and quota responses intentionally use differ
 ```
 
 A generic 429 is **not** an account-rotation signal. Before any alternate profile is tried, the router probes `fetchAvailableModels` with the failed profile's own access-token/project pair and requires the exact wire model to report zero remaining quota. It then requires another registered profile's same wire model to report positive remaining quota. Only then is the original request replayed once with that alternate profile's token and project as one credential snapshot. Unknown, missing, or still-positive quota evidence returns the original 429 without rotation.
+
+The probe sequence has one five-second deadline. A successful alternate becomes the conversation account for subsequent turns. Pinned selectors and requests with existing tool history never switch accounts. Streaming output is never retried. Model-specific quota observations have a bounded one-minute cache: new conversations may prefer a recently verified usable account while the preferred account is exhausted. Existing bindings do not move when that cache expires.
 
 ## Example Responses calls
 
@@ -279,7 +302,7 @@ The HTTP server no longer requires an active Codex profile before listening. Thi
 ```text
 /healthz                         -> available when the router is healthy
 /backend-api/* without Codex    -> Codex auth unavailable
-Antigravity model without login -> provider-not-configured error
+Antigravity model without login -> account_unavailable error
 ```
 
 Live model discovery is never a startup dependency.
@@ -290,7 +313,9 @@ Local compatibility errors use JSON error objects. Common cases include:
 
 - `401 invalid_api_key`: the bearer key does not match the router `client-key`;
 - `400 invalid_request_error`: malformed JSON, `store:true`, unsupported request shape, or unsupported provider prefix;
-- `503 provider_not_configured`: the requested provider has no usable active login;
+- `503 account_unavailable`: the selected Antigravity account is unavailable, or no recently verified usable account remains during quota cooldown;
+- `503 session_continuity_unavailable`: conversation/account affinity is missing, expired, or conflicts with a selector;
+- `400 invalid_request_error` with `session_continuity_unavailable`: a bound Gemini conversation is missing a valid tool signature;
 - bounded upstream 4xx/5xx errors: no raw provider body, token, project ID, or HTML challenge page is reflected to the caller.
 
 ## Observability

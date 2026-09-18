@@ -369,8 +369,11 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 	antigravityBackend := antigravity.New(antigravityBroker)
 	antigravityBackend.SetRequestLogger(logger.Emit)
 	providerRouter := &openaiapi.ProviderRouter{
-		Codex:       openaiapi.NewCodexBackend(handler, clientVersion),
-		Antigravity: antigravityBackend,
+		Default: "codex",
+		Providers: map[string]openaiapi.ResponsesBackend{
+			"codex":              openaiapi.NewCodexBackend(handler, clientVersion),
+			"google-antigravity": antigravityBackend,
+		},
 	}
 	openAIHandler, err := openaiapi.NewWithRouter(providerRouter, clientKey)
 	if err != nil {

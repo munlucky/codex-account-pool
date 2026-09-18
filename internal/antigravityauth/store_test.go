@@ -3,6 +3,7 @@ package antigravityauth
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -27,7 +28,9 @@ func TestStoreRoundTripAndPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	// Windows FileMode does not represent ACLs. Keep the round-trip assertions
+	// above on every platform; POSIX permission bits apply only on Unix.
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("credential file is too permissive: %o", info.Mode().Perm())
 	}
 }

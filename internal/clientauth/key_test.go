@@ -2,6 +2,7 @@ package clientauth
 
 import (
 	"os"
+	"runtime"
 	"testing"
 )
 
@@ -22,7 +23,8 @@ func TestEnsurePersistsStableKeyAndMatchesBearer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	// FileMode on Windows is not an ACL security check.
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("client key permissions too broad: %v", info.Mode().Perm())
 	}
 }

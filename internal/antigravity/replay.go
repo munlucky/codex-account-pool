@@ -1,6 +1,7 @@
 package antigravity
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -28,6 +29,13 @@ type ReplayCache struct {
 	max     int
 	ttl     time.Duration
 	now     func() time.Time
+	calls   map[string]callRecord
+}
+
+type callRecord struct {
+	profile, model, session, name, wireID, signature string
+	args                                             [32]byte
+	expiresAt, usedAt                                time.Time
 }
 
 func NewReplayCache(max int, ttl time.Duration) *ReplayCache {
@@ -37,7 +45,49 @@ func NewReplayCache(max int, ttl time.Duration) *ReplayCache {
 	if ttl <= 0 {
 		ttl = defaultReplayTTL
 	}
-	return &ReplayCache{entries: make(map[string]replayEntry), max: max, ttl: ttl, now: time.Now}
+	return &ReplayCache{entries: make(map[string]replayEntry), calls: make(map[string]callRecord), max: max, ttl: ttl, now: time.Now}
+}
+
+// Opaque local call handles let headerless clients (including Qwen) resume the
+// exact session without identifying it by prompt text. Wire IDs remain private.
+func (c *ReplayCache) RememberCall(id, wireID, profile, model, session, name string, args any, signature string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.nowTime()
+	c.sweepLocked(now)
+	if len(c.calls) >= c.max {
+		oldest := ""
+		for k, v := range c.calls {
+			if oldest == "" || v.usedAt.Before(c.calls[oldest].usedAt) {
+				oldest = k
+			}
+		}
+		delete(c.calls, oldest)
+	}
+	if !isLikelyRealThoughtSignature(signature) {
+		signature = ""
+	}
+	c.calls[id] = callRecord{profile: profile, model: model, session: session, name: name, wireID: wireID, signature: signature, args: sha256.Sum256([]byte(canonicalArgs(args))), expiresAt: now.Add(c.ttl), usedAt: now}
+}
+
+func (c *ReplayCache) LookupCall(id, model, name string, args any) (callRecord, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.nowTime()
+	record, ok := c.calls[id]
+	if !ok {
+		return callRecord{}, false
+	}
+	if !record.expiresAt.After(now) {
+		delete(c.calls, id)
+		return callRecord{}, false
+	}
+	if record.model != model || record.name != name || record.args != sha256.Sum256([]byte(canonicalArgs(args))) {
+		return callRecord{}, false
+	}
+	record.usedAt = now
+	c.calls[id] = record
+	return record, true
 }
 
 func (c *ReplayCache) Lookup(profileID, model, session, name string, args any) (string, bool) {
@@ -98,9 +148,19 @@ func (c *ReplayCache) ClearSession(profileID, model, session string) {
 			delete(c.entries, key)
 		}
 	}
+	for id, record := range c.calls {
+		if record.profile == profileID && record.model == model && record.session == session {
+			delete(c.calls, id)
+		}
+	}
 }
 
 func (c *ReplayCache) sweepLocked(now time.Time) {
+	for id, record := range c.calls {
+		if !record.expiresAt.After(now) {
+			delete(c.calls, id)
+		}
+	}
 	for key, entry := range c.entries {
 		if !entry.expiresAt.After(now) {
 			delete(c.entries, key)

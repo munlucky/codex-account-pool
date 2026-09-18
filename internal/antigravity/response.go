@@ -127,15 +127,16 @@ func translateCCAStream(w http.ResponseWriter, body io.Reader, externalModel, wi
 					if err != nil {
 						return fail("Google Antigravity returned invalid function arguments.")
 					}
-					callID, _ := call["id"].(string)
-					if callID == "" {
-						callID = "call_ag_" + randomHex(10)
-					}
-					identity := name + "\x00" + string(encodedArgs) + "\x00" + callID
+					wireCallID, _ := call["id"].(string)
+					identity := name + "\x00" + string(encodedArgs) + "\x00" + wireCallID
 					if seenCalls[identity] {
 						continue
 					}
 					seenCalls[identity] = true
+					callID := "call_ag_" + randomHex(16)
+					if wireCallID == "" {
+						wireCallID = callID
+					}
 					itemID := "fc_ag_" + randomHex(10)
 					index := nextOutputIndex
 					nextOutputIndex++
@@ -145,6 +146,7 @@ func translateCCAStream(w http.ResponseWriter, body io.Reader, externalModel, wi
 					if isLikelyRealThoughtSignature(signature) {
 						replay.Remember(profileID, wireModel, session, name, args, signature)
 					}
+					replay.RememberCall(callID, wireCallID, profileID, wireModel, session, name, args, signature)
 					writeSSE(w, map[string]any{"type": "response.output_item.added", "output_index": index, "item": map[string]any{
 						"id": itemID, "type": "function_call", "status": "in_progress", "call_id": callID, "name": name, "arguments": "",
 					}})

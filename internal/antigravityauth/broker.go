@@ -48,7 +48,48 @@ func (b *Broker) Credentials(ctx context.Context) (Credentials, error) {
 }
 
 func (b *Broker) ForceRefresh(ctx context.Context, profileID string) (Credentials, error) {
+	if _, err := b.validateProfile(profileID); err != nil {
+		return Credentials{}, err
+	}
 	return b.credentialsFor(ctx, profileID, true)
+}
+
+func (b *Broker) validateProfile(id string) (*profile.Registry, error) {
+	if b == nil || b.Profiles == nil || b.CredentialsStore == nil {
+		return nil, errors.New("account unavailable")
+	}
+	registry, err := b.Profiles.Load()
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := registry.Find(profile.ProviderGoogleAntigravity, id); !ok {
+		return nil, errors.New("account unavailable")
+	}
+	return registry, nil
+}
+
+func (b *Broker) Accounts(ctx context.Context) (string, []string, error) {
+	if b == nil || b.Profiles == nil {
+		return "", nil, errors.New("account unavailable")
+	}
+	registry, err := b.Profiles.Load()
+	if err != nil {
+		return "", nil, err
+	}
+	var ids []string
+	for _, p := range registry.Profiles {
+		if p.Provider == profile.ProviderGoogleAntigravity {
+			ids = append(ids, p.ID)
+		}
+	}
+	return registry.Active[profile.ProviderGoogleAntigravity], ids, nil
+}
+
+func (b *Broker) CredentialsFor(ctx context.Context, id string) (Credentials, error) {
+	if _, err := b.validateProfile(id); err != nil {
+		return Credentials{}, err
+	}
+	return b.credentialsFor(ctx, id, false)
 }
 
 // CandidateCredentials returns other usable Antigravity profiles in registry order.

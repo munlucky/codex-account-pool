@@ -85,6 +85,16 @@ If a refresh grant is no longer usable, explicitly sign in to that profile again
 
 ## Profile selection and usage-limit failover
 
+Antigravity account policy stores IDs and bounded in-memory affinity/quota observations, not tokens or project bindings. Credentials are reloaded for the selected registered Google profile each request. `auth use` affects new conversations. Local `X-AI-Account` selectors require the existing router key, are stripped before backend dispatch, and never silently fall back.
+
+Random tool-call handles bind profile, wire model, session, function name, and argument digest. They let headerless clients continue the same conversation without equating identical prompt text with identity. They are process-local continuity handles, not an authentication boundary or a replacement for the local API key. Existing single-user/loopback requirements still apply. Tool history never triggers cross-account failover; missing or expired continuity fails locally.
+
+Antigravity quota failover requires observed exhaustion and a verified usable alternate, allows at most one alternate, and stops before streaming. Probe observations expire after one minute. Generic 429, unknown quota, explicit selectors, and existing tool history do not initiate rotation. Raw upstream error bodies are classified into fixed categories and never reflected into API responses or lifecycle logs.
+
+POSIX file permission assertions run on Unix. Go FileMode on Windows does not attest Windows ACL restrictions; local tests do not claim to audit those ACLs.
+
+The following existing selection behavior applies to Codex:
+
 An explicit profile selection becomes the preferred account for new requests. Automatic failover is intentionally narrow: only a ChatGPT HTTP 429 whose structured error identifies a subscription usage limit (`usage_limit_reached` or `usage_limit_exceeded`) can suppress the current profile and select another registered profile.
 
 A request is replayed only after a successful profile change. A per-request attempted-profile guard prevents cycling when every registered account is exhausted. Existing streams remain bound to the credentials selected when that request began.

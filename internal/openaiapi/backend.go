@@ -51,67 +51,115 @@ type ResponsesBackend interface {
 	Models(context.Context) ([]Model, error)
 }
 
+// RouteTarget keeps routing independent of backend transport and credentials.
+type RouteTarget struct {
+	Provider        string
+	Model           string
+	AccountSelector string
+}
+type routeKey struct{}
+
+func RequestRoute(r *http.Request) RouteTarget {
+	if r == nil {
+		return RouteTarget{}
+	}
+	target, _ := r.Context().Value(routeKey{}).(RouteTarget)
+	return target
+}
+
+const AccountSelectorHeader = "X-AI-Account"
+
 type ProviderRouter struct {
-	Codex       ResponsesBackend
-	Antigravity ResponsesBackend
+	Default   string
+	Providers map[string]ResponsesBackend
 }
 
+// Resolve preserves bare-model routing to the configured default provider.
 func (r *ProviderRouter) Resolve(model string) (ResponsesBackend, string, error) {
-	model = strings.TrimSpace(model)
-	if model == "" {
-		return nil, "", errors.New("model is required")
-	}
-	if strings.HasPrefix(model, googleAntigravityPrefix) {
-		upstream := strings.TrimSpace(strings.TrimPrefix(model, googleAntigravityPrefix))
-		if upstream == "" || strings.Contains(upstream, "/") {
-			return nil, "", fmt.Errorf("invalid google-antigravity model id %q", model)
-		}
-		if r == nil || r.Antigravity == nil {
-			return nil, "", errors.New("google-antigravity provider is not configured")
-		}
-		return r.Antigravity, upstream, nil
-	}
-	if strings.Contains(model, "/") {
-		provider, _, _ := strings.Cut(model, "/")
-		return nil, "", fmt.Errorf("unsupported provider prefix %q", provider)
-	}
-	if r == nil || r.Codex == nil {
-		return nil, "", errors.New("codex provider is not configured")
-	}
-	return r.Codex, model, nil
+	backend, target, err := r.ResolveTarget(model, "")
+	return backend, target.Model, err
 }
-
+func (r *ProviderRouter) ResolveTarget(model, selector string) (ResponsesBackend, RouteTarget, error) {
+	target := RouteTarget{Model: strings.TrimSpace(model), AccountSelector: strings.TrimSpace(selector)}
+	if r == nil {
+		return nil, target, errors.New("provider router is not configured")
+	}
+	target.Provider = r.Default
+	if target.Provider == "" {
+		target.Provider = "codex"
+	}
+	if strings.Contains(target.Model, "/") {
+		target.Provider, target.Model, _ = strings.Cut(target.Model, "/")
+	}
+	if target.Model == "" || strings.TrimSpace(target.Model) != target.Model || strings.Contains(target.Model, "/") {
+		return nil, target, errors.New("invalid model id")
+	}
+	backend := r.Providers[target.Provider]
+	if backend == nil {
+		return nil, target, fmt.Errorf("provider %q is not configured", target.Provider)
+	}
+	if target.AccountSelector != "" {
+		capable, ok := backend.(interface{ SupportsAccountSelector() bool })
+		if !ok || !capable.SupportsAccountSelector() {
+			return nil, target, errors.New("account selector is unsupported by this provider")
+		}
+		if !validAccountSelector(target.AccountSelector) {
+			return nil, target, errors.New("invalid account selector")
+		}
+	}
+	return backend, target, nil
+}
+func validAccountSelector(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i, c := range s {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		if i > 0 && (c == '.' || c == '_' || c == '-') {
+			continue
+		}
+		return false
+	}
+	return true
+}
 func (r *ProviderRouter) Models(ctx context.Context) ([]Model, error) {
 	if r == nil {
 		return nil, errors.New("provider router is not configured")
 	}
 	var out []Model
 	var errs []error
-	if r.Codex != nil {
-		models, err := r.Codex.Models(ctx)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("codex: %w", err))
-		} else {
-			out = append(out, models...)
-		}
+	names := make([]string, 0, len(r.Providers))
+	for name := range r.Providers {
+		names = append(names, name)
 	}
-	if r.Antigravity != nil {
-		models, err := r.Antigravity.Models(ctx)
+	sort.Strings(names)
+	defaultProvider := r.Default
+	if defaultProvider == "" {
+		defaultProvider = "codex"
+	}
+	for _, name := range names {
+		backend := r.Providers[name]
+		if backend == nil {
+			continue
+		}
+		models, err := backend.Models(ctx)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("google-antigravity: %w", err))
-		} else {
-			for _, model := range models {
-				if !strings.HasPrefix(model.ID, googleAntigravityPrefix) {
-					model.ID = googleAntigravityPrefix + model.ID
-				}
-				if model.Object == "" {
-					model.Object = "model"
-				}
-				if model.OwnedBy == "" {
-					model.OwnedBy = "google-antigravity"
-				}
-				out = append(out, model)
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+			continue
+		}
+		for _, model := range models {
+			if name != defaultProvider && !strings.HasPrefix(model.ID, name+"/") {
+				model.ID = name + "/" + model.ID
 			}
+			if model.Object == "" {
+				model.Object = "model"
+			}
+			if model.OwnedBy == "" {
+				model.OwnedBy = name
+			}
+			out = append(out, model)
 		}
 	}
 	if len(out) == 0 && len(errs) > 0 {
