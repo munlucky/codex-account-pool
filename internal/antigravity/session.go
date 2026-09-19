@@ -44,25 +44,52 @@ func (c *Client) resolveSession(r *http.Request, payload map[string]any, model s
 		return sessionID(r, payload), nil
 	}
 	input, _ := payload["input"].([]any)
+	currentStart := currentTurnStart(input)
+
+	// Tool calls in the active user turn are strict: every router-issued handle
+	// must still resolve and all calls must belong to the same provider session.
 	session := ""
-	for _, raw := range input {
-		item, _ := raw.(map[string]any)
-		if item["type"] != "function_call" {
+	currentCalls := 0
+	for i := currentStart; i < len(input); i++ {
+		item, _ := input[i].(map[string]any)
+		if item == nil || item["type"] != "function_call" {
 			continue
 		}
 		id, _ := item["call_id"].(string)
 		name, _ := item["name"].(string)
 		args, _ := item["arguments"].(string)
+		if !strings.HasPrefix(id, "call_ag_") {
+			continue
+		}
 		record, ok := c.replay().LookupCall(id, model, name, args)
 		if !ok || (session != "" && record.session != session) {
 			return "", errors.New("session_continuity_unavailable")
 		}
 		session = record.session
+		currentCalls++
 	}
-	if session == "" {
-		return "", errors.New("session_continuity_unavailable")
+	if currentCalls > 0 && session != "" {
+		return session, nil
 	}
-	return session, nil
+
+	// A fresh user turn may carry a long completed history. Recover identity from
+	// the newest surviving router handle, but do not make an expired old call fatal.
+	for i := currentStart - 1; i >= 0; i-- {
+		item, _ := input[i].(map[string]any)
+		if item == nil || item["type"] != "function_call" {
+			continue
+		}
+		id, _ := item["call_id"].(string)
+		if !strings.HasPrefix(id, "call_ag_") {
+			continue
+		}
+		name, _ := item["name"].(string)
+		args, _ := item["arguments"].(string)
+		if record, ok := c.replay().LookupCall(id, model, name, args); ok {
+			return record.session, nil
+		}
+	}
+	return "", errors.New("session_continuity_unavailable")
 }
 
 func hasToolHistory(payload map[string]any) bool {

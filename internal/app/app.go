@@ -366,7 +366,10 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 		fmt.Fprintf(a.Err, "warning: could not persist Codex client version: %v\n", err)
 	}
 	antigravityBroker := antigravityauth.NewBroker(a.Store)
-	antigravityBackend := antigravity.New(antigravityBroker)
+	antigravityBackend, err := antigravity.NewPersistent(antigravityBroker, a.Store.Root())
+	if err != nil {
+		return fmt.Errorf("initialize Antigravity continuity: %w", err)
+	}
 	antigravityBackend.SetRequestLogger(logger.Emit)
 	providerRouter := &openaiapi.ProviderRouter{
 		Default: "codex",

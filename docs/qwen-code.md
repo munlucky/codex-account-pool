@@ -1,6 +1,6 @@
 # Qwen Code integration
 
-For `google-antigravity/*`, Qwen must echo the router-returned opaque `call_id` with the unchanged function name and arguments. The router recovers the original conversation/account even when Qwen sends no conversation header. It never groups conversations by their first prompt text. After router restart or cache expiry, start a new conversation if `session_continuity_unavailable` is returned.
+For `google-antigravity/*`, Qwen must echo the router-returned opaque `call_id` with the unchanged function name and arguments. The router recovers the original conversation/account even when Qwen sends no conversation header. It never groups conversations by their first prompt text. Antigravity continuity is persisted under the router state root and survives a normal container/router restart. The default idle window is seven days with a 30-day absolute cap; if continuity is genuinely outside retention or a current handle is altered, start a new conversation when `session_continuity_unavailable` is returned.
 
 Clients may supply a unique `X-Client-Thread-Id` per conversation to retain account affinity across plain-text turns as well. Do not hardcode one shared ID for concurrent sessions. The local regression suite covers headerless Responses tool continuation, Chat translation, account changes, and signature restoration with a fake upstream; it is not a fresh credentialed Qwen/Google live test.
 

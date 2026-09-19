@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -262,7 +263,7 @@ func TestAPIContinuityLossFailsBeforeUpstream(t *testing.T) {
 	if w.Code != 503 {
 		t.Fatal(w.Code, w.Body.String())
 	}
-	c.Replay.now = func() time.Time { return time.Now().Add(time.Hour) }
+	c.Replay.now = func() time.Time { return time.Now().Add(8 * 24 * time.Hour) }
 	w = apiCall(h, "/v1/responses", nextPayload, "one", "")
 	if w.Code != 400 || !strings.Contains(w.Body.String(), "session_continuity_unavailable") {
 		t.Fatal(w.Code, w.Body.String())
@@ -417,7 +418,7 @@ func TestInvalidSchemaAndSelectorRejectedBeforeUpstream(t *testing.T) {
 	}
 }
 
-func TestMultiToolCallsPreserveSignatureAcrossAllCalls(t *testing.T) {
+func TestParallelToolCallsPreserveStepAndSingleSignature(t *testing.T) {
 	_, broker := testRegistry(t)
 	multiToolStream := "data: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[" +
 		"{\"thought\":true,\"thoughtSignature\":\"" + testSignature + "\"}," +
@@ -428,9 +429,44 @@ func TestMultiToolCallsPreserveSignatureAcrossAllCalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		if strings.Contains(string(body), "functionResponse") {
-			contents := string(body)
-			if strings.Count(contents, testSignature) < 2 {
-				t.Errorf("expected both tool calls to have thoughtSignature, body: %s", contents)
+			var request map[string]any
+			if err := json.Unmarshal(body, &request); err != nil {
+				t.Fatal(err)
+			}
+			envelopeRequest := request["request"].(map[string]any)
+			contents := envelopeRequest["contents"].([]any)
+			if strings.Count(string(body), testSignature) != 1 {
+				t.Errorf("parallel step must replay thoughtSignature exactly once, body: %s", string(body))
+			}
+			var modelParts, responseParts int
+			for _, rawContent := range contents {
+				content := rawContent.(map[string]any)
+				parts := content["parts"].([]any)
+				if content["role"] == "model" {
+					calls := 0
+					for _, rawPart := range parts {
+						if _, ok := rawPart.(map[string]any)["functionCall"]; ok {
+							calls++
+						}
+					}
+					if calls == 2 {
+						modelParts = calls
+					}
+				}
+				if content["role"] == "user" {
+					responses := 0
+					for _, rawPart := range parts {
+						if _, ok := rawPart.(map[string]any)["functionResponse"]; ok {
+							responses++
+						}
+					}
+					if responses == 2 {
+						responseParts = responses
+					}
+				}
+			}
+			if modelParts != 2 || responseParts != 2 {
+				t.Errorf("parallel calls/results were not grouped by Gemini step: %s", string(body))
 			}
 			io.WriteString(w, textStream)
 		} else {
@@ -477,3 +513,146 @@ func TestMultiToolCallsPreserveSignatureAcrossAllCalls(t *testing.T) {
 	}
 }
 
+func TestCompletedOldToolHistoryDoesNotInvalidateFreshTurn(t *testing.T) {
+	replay := NewReplayCache(16, time.Hour)
+	payload := map[string]any{
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "old question"},
+			map[string]any{"type": "function_call", "call_id": "call_ag_expired", "name": "weather", "arguments": "{\"city\":\"Seoul\"}"},
+			map[string]any{"type": "function_call_output", "call_id": "call_ag_expired", "output": "sunny"},
+			map[string]any{"type": "message", "role": "user", "content": "new question"},
+		},
+	}
+	prepared, err := prepareRequest(payload, "gemini-3.8-flash", "-session", "google-1", replay)
+	if err != nil {
+		t.Fatalf("completed old history should be tolerated: %v", err)
+	}
+	contents := prepared.Body["contents"].([]any)
+	if len(contents) != 4 {
+		t.Fatalf("contents=%v", contents)
+	}
+}
+
+func TestCurrentTurnStillRequiresRouterContinuity(t *testing.T) {
+	replay := NewReplayCache(16, time.Hour)
+	payload := map[string]any{
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "question"},
+			map[string]any{"type": "function_call", "call_id": "call_ag_missing", "name": "weather", "arguments": "{\"city\":\"Seoul\"}"},
+			map[string]any{"type": "function_call_output", "call_id": "call_ag_missing", "output": "sunny"},
+		},
+	}
+	if _, err := prepareRequest(payload, "gemini-3.8-flash", "-session", "google-1", replay); err == nil || !strings.Contains(err.Error(), "session_continuity_unavailable") {
+		t.Fatalf("current turn accepted without continuity: %v", err)
+	}
+}
+
+func TestCurrentGeminiStepRequiresLeadingSignature(t *testing.T) {
+	replay := NewReplayCache(16, time.Hour)
+	args := map[string]any{"city": "Seoul"}
+	replay.RememberCall("call_ag_unsigned", "wire_1", "google-1", "gemini-3.8-flash-medium", "-session", "weather", args, "", "step-1", 0)
+	payload := map[string]any{
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "question"},
+			map[string]any{"type": "function_call", "call_id": "call_ag_unsigned", "name": "weather", "arguments": "{\"city\":\"Seoul\"}"},
+			map[string]any{"type": "function_call_output", "call_id": "call_ag_unsigned", "output": "sunny"},
+		},
+	}
+	if _, err := prepareRequest(payload, "gemini-3.8-flash", "-session", "google-1", replay); err == nil || !strings.Contains(err.Error(), "leading thought signature") {
+		t.Fatalf("unsigned leading call accepted: %v", err)
+	}
+}
+
+func TestPersistentContinuitySurvivesRestartAndRestoresProfile(t *testing.T) {
+	store, broker := testRegistry(t)
+	var mu sync.Mutex
+	var tokens []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		call := len(tokens)
+		mu.Unlock()
+		if call == 1 {
+			io.WriteString(w, toolStream)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), testSignature) || !strings.Contains(string(body), "\"id\":\"call_1\"") {
+			t.Errorf("persisted wire continuity was not restored: %s", string(body))
+		}
+		io.WriteString(w, textStream)
+	}))
+	defer server.Close()
+
+	firstClient, err := NewPersistent(broker, store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstClient.BaseURL = server.URL
+	firstClient.HTTP = server.Client()
+	first := apiCall(testAPI(t, firstClient), "/v1/responses", firstPayload, "", "")
+	if first.Code != 200 {
+		t.Fatal(first.Code, first.Body.String())
+	}
+	callID := returnedCallID(t, first)
+
+	registry, _ := store.Load()
+	registry.Use(profile.ProviderGoogleAntigravity, "B")
+	if err := store.Save(registry); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewPersistent(broker, store.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.BaseURL = server.URL
+	restarted.HTTP = server.Client()
+	second := apiCall(testAPI(t, restarted), "/v1/responses", strings.ReplaceAll(nextPayload, "call_1", callID), "", "")
+	if second.Code != 200 {
+		t.Fatal(second.Code, second.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(tokens, ",") != "Bearer token-A,Bearer token-A" {
+		t.Fatalf("restart changed pinned account: %v", tokens)
+	}
+}
+
+func TestSlidingTTLIsPersistedAfterActivity(t *testing.T) {
+	root := t.TempDir()
+	path := root + "/continuity.json"
+	base := time.Now()
+	cache, err := NewPersistentReplayCache(16, 10*time.Minute, time.Hour, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.now = func() time.Time { return base }
+	args := map[string]any{"city": "Seoul"}
+	cache.RememberCall("call_ag_test", "wire_1", "A", "gemini", "session", "weather", args, testSignature, "step-1", 0)
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(persisted), "Seoul") {
+		t.Fatal("raw tool arguments leaked into continuity state")
+	}
+
+	cache.now = func() time.Time { return base.Add(6 * time.Minute) }
+	if _, ok := cache.LookupCall("call_ag_test", "gemini", "weather", args); !ok {
+		t.Fatal("active call expired before idle TTL")
+	}
+	if !cache.BindSession("A", "gemini", "session") {
+		t.Fatal("could not persist sliding activity")
+	}
+
+	restarted, err := NewPersistentReplayCache(16, 10*time.Minute, time.Hour, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.now = func() time.Time { return base.Add(11 * time.Minute) }
+	if _, ok := restarted.LookupCall("call_ag_test", "gemini", "weather", args); !ok {
+		t.Fatal("sliding TTL was not persisted across restart")
+	}
+}

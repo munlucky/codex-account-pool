@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -49,11 +50,25 @@ type Client struct {
 }
 
 func New(broker CredentialProvider) *Client {
+	return newClient(broker, NewReplayCache(0, 0))
+}
+
+func NewPersistent(broker CredentialProvider, stateRoot string) (*Client, error) {
+	replay, err := NewPersistentReplayCache(
+		0, 0, 0, filepath.Join(stateRoot, "antigravity", "continuity.json"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return newClient(broker, replay), nil
+}
+
+func newClient(broker CredentialProvider, replay *ReplayCache) *Client {
 	httpClient := &http.Client{
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	return &Client{
-		Broker: broker, Pool: accountpool.New(0, 0), HTTP: httpClient, BaseURL: defaultBaseURL, UserAgent: antigravityauth.UserAgent(), Replay: NewReplayCache(0, 0), Now: time.Now,
+		Broker: broker, Pool: accountpool.New(0, 0), HTTP: httpClient, BaseURL: defaultBaseURL, UserAgent: antigravityauth.UserAgent(), Replay: replay, Now: time.Now,
 		catalog: make(map[string]cachedCatalog),
 	}
 }
@@ -149,9 +164,6 @@ func (c *Client) ServeResponses(w http.ResponseWriter, r *http.Request, upstream
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		hint := readErrorHint(resp.Body)
-		if resp.StatusCode == http.StatusBadRequest && strings.Contains(hint, "signature") {
-			c.replay().ClearSession(credentials.ProfileID, prepared.WireModel, session)
-		}
 		status := resp.StatusCode
 		if status < 400 || status > 599 {
 			status = http.StatusBadGateway
@@ -172,6 +184,7 @@ func (c *Client) ServeResponses(w http.ResponseWriter, r *http.Request, upstream
 	}
 
 	lease.policy.ObserveSuccess(credentials.ProfileID)
+	c.replay().BindSession(credentials.ProfileID, prepared.WireModel, session)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)

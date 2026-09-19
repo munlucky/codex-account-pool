@@ -25,6 +25,12 @@ func (c *Client) acquireAccount(ctx context.Context, session, model, selector st
 	if err != nil {
 		return nil, antigravityauth.Credentials{}, err
 	}
+	if profile, ok := c.replay().SessionProfile(model, session); ok {
+		if err := policy.RestoreProfile(profile); err != nil {
+			policy.Release()
+			return nil, antigravityauth.Credentials{}, err
+		}
+	}
 	l := &accountLease{policy: policy, broker: c.Broker, history: history}
 	policy.SetModel(model)
 	preferred := ""

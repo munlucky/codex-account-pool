@@ -51,7 +51,40 @@ func responsesInputToGemini(raw any, profileID, model, session string, replay *R
 	systemText := ""
 	callNames := map[string]string{}
 	callWireIDs := map[string]string{}
-	for _, rawItem := range input {
+	callSteps := map[string]string{}
+	callPositions := map[string]int{}
+	modelSteps := map[string]int{}
+	userSteps := map[string]int{}
+	currentStart := currentTurnStart(input)
+
+	appendStepPart := func(role, step string, position int, part map[string]any) {
+		indexes := modelSteps
+		if role == "user" {
+			indexes = userSteps
+		}
+		if step != "" {
+			if index, ok := indexes[step]; ok {
+				content := contents[index].(map[string]any)
+				parts := content["parts"].([]any)
+				if position >= 0 && position < len(parts) {
+					parts = append(parts, nil)
+					copy(parts[position+1:], parts[position:])
+					parts[position] = part
+					content["parts"] = parts
+				} else {
+					content["parts"] = append(parts, part)
+				}
+				return
+			}
+		}
+		index := len(contents)
+		contents = append(contents, map[string]any{"role": role, "parts": []any{part}})
+		if step != "" {
+			indexes[step] = index
+		}
+	}
+
+	for itemIndex, rawItem := range input {
 		item, ok := rawItem.(map[string]any)
 		if !ok {
 			return nil, "", fmt.Errorf("input items must be JSON objects")
@@ -91,26 +124,52 @@ func responsesInputToGemini(raw any, profileID, model, session string, replay *R
 					return nil, "", fmt.Errorf("function_call %s has invalid JSON arguments", name)
 				}
 			}
+
+			strict := itemIndex >= currentStart
 			callNames[callID] = name
 			wireID := callID
-			signature, found := replay.Lookup(profileID, model, session, name, args)
+			stepID := ""
+			position := -1
+			signature := ""
+			foundSignature := false
 			isCallAg := strings.HasPrefix(callID, "call_ag_")
+
 			if isCallAg {
-				record, ok := replay.LookupCall(callID, model, name, args)
-				if !ok || record.profile != profileID || record.session != session {
-					return nil, "", fmt.Errorf("session_continuity_unavailable: invalid or expired tool call")
+				record, found := replay.LookupCall(callID, model, name, args)
+				valid := found && record.profile == profileID && record.session == session
+				if !valid {
+					if strict {
+						return nil, "", fmt.Errorf("session_continuity_unavailable: current tool call is invalid or expired")
+					}
+				} else {
+					wireID = record.wireID
+					signature = record.signature
+					foundSignature = signature != ""
+					stepID = record.step
+					position = record.position
+					if strict && strings.Contains(strings.ToLower(model), "gemini") && position == 0 && !foundSignature {
+						return nil, "", fmt.Errorf("session_continuity_unavailable: current Gemini step is missing its leading thought signature")
+					}
 				}
-				wireID, signature = record.wireID, record.signature
-				found = signature != ""
+			} else {
+				signature, foundSignature = replay.Lookup(profileID, model, session, name, args)
+				if strict && strings.Contains(strings.ToLower(model), "gemini") && !foundSignature {
+					return nil, "", fmt.Errorf("session_continuity_unavailable: current tool signature expired or conversation identity changed")
+				}
+			}
+
+			if stepID == "" {
+				stepID = "legacy:" + callID
 			}
 			callWireIDs[callID] = wireID
+			callSteps[callID] = stepID
+			callPositions[callID] = position
 			part := map[string]any{"functionCall": map[string]any{"id": wireID, "name": name, "args": args}}
-			if found {
+			if foundSignature {
 				part["thoughtSignature"] = signature
-			} else if !isCallAg && strings.Contains(strings.ToLower(model), "gemini") {
-				return nil, "", fmt.Errorf("session_continuity_unavailable: tool signature expired or conversation identity changed")
 			}
-			contents = append(contents, map[string]any{"role": "model", "parts": []any{part}})
+			appendStepPart("model", stepID, position, part)
+
 		case "function_call_output":
 			callID, _ := item["call_id"].(string)
 			if callID == "" {
@@ -122,12 +181,28 @@ func responsesInputToGemini(raw any, profileID, model, session string, replay *R
 			}
 			response := map[string]any{"result": item["output"]}
 			part := map[string]any{"functionResponse": map[string]any{"id": callWireIDs[callID], "name": name, "response": response}}
-			contents = append(contents, map[string]any{"role": "user", "parts": []any{part}})
+			appendStepPart("user", callSteps[callID], callPositions[callID], part)
 		default:
 			return nil, "", fmt.Errorf("unsupported Responses input item type %q", typ)
 		}
 	}
 	return contents, systemText, nil
+}
+
+func currentTurnStart(input []any) int {
+	start := 0
+	for i, raw := range input {
+		item, _ := raw.(map[string]any)
+		if item == nil {
+			continue
+		}
+		typ, _ := item["type"].(string)
+		role, _ := item["role"].(string)
+		if (typ == "message" || typ == "") && role == "user" {
+			start = i
+		}
+	}
+	return start
 }
 
 func messageParts(raw any) ([]any, string, error) {

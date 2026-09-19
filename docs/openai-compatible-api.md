@@ -169,30 +169,32 @@ Malformed or prematurely truncated CCA streams are not treated as completed gene
 
 ### Account and thought-signature continuity
 
-Account selection lives in a credential-free pool, separate from the HTTP adapter. Every request reloads one selected profile's current token/project snapshot. Requests in the same conversation serialize through the end of the stream; other conversations remain independent. The pool holds at most 1024 conversations, with 30-minute idle expiry and idle-entry eviction. It never evicts an in-flight lease.
+Account selection lives in a credential-free pool, separate from the HTTP adapter. Every request reloads one selected profile's current token/project snapshot. Requests in the same conversation serialize through the end of the stream; other conversations remain independent. The short-lived in-memory lease can expire without losing conversation identity because Antigravity profile affinity is rehydrated from the provider continuity store.
 
 Use a unique conversation identifier in `X-Client-Thread-Id`, `X-OpenAI-Conversation-Id`, or `X-Codex-Parent-Thread-Id`. A Responses `prompt_cache_key` can also identify a conversation, but must be unique per conversation, not shared merely because prompts use the same cache template. Explicit headers take precedence over `prompt_cache_key`.
 
-Headerless clients receive opaque router-generated `call_id` values. Echo each returned `call_id`, function name, and arguments unchanged in subsequent tool history. A bounded in-memory registry recovers the original conversation and restores the provider's original wire call ID and signature. Identical initial prompts in different conversations do not share identity. Headerless requests without tool history are independent requests; use an explicit identifier to preserve account affinity across plain-text turns.
+Headerless clients receive opaque router-generated `call_id` values. Echo each returned `call_id`, function name, and arguments unchanged in subsequent tool history. The router stores the matching Google profile, provider session, original wire call ID, argument digest, Gemini step/position, and provider thought signature under the managed state root. A normal container/router restart reloads that state, so the same opaque handle continues to resolve. Identical initial prompts in different conversations do not share identity. Headerless requests without tool history are independent requests; use an explicit identifier to preserve affinity across plain-text turns.
 
-The cache holds up to 1024 signature entries and 1024 call handles, expiring after 30 minutes. Handles bind the function name and canonical argument digest. Invalid, expired, mixed-session, or altered handles fail locally. Restart, expiry, or eviction can make tool continuation unavailable. Start a new conversation when `session_continuity_unavailable` is returned; the router does not invent signatures or replay them under another account.
+Continuity uses a seven-day sliding idle window and a 30-day absolute retention cap. Activity extends the idle deadline. Capacity pressure removes an idle session as a unit rather than evicting one call from an otherwise valid active history. Altered current-turn handles, mixed sessions, argument mismatches, or an unsigned leading Gemini call fail locally.
+
+Validation is turn-aware. Tool calls in the current user turn are strict because Gemini requires the current function-calling step to preserve its reasoning signature. Missing replay data from a completed older turn does not by itself abort a fresh user turn. For parallel Gemini calls, the router restores the original model step, keeps the function calls together, keeps their results together, and places the thought signature only on the leading call for that step. Sequential model steps retain separate signatures.
 
 For an exact Antigravity profile, send `X-AI-Account: google-2`. The local header is removed before dispatch and never sent upstream. Unknown or wrong-provider profiles fail without fallback. A selector conflicting with existing tool history fails continuity validation. A pinned request never fails over. Codex rejects this unsupported header; its existing gateway behavior remains unchanged.
 
-Provider reasoning/tool continuity uses a bounded process-memory replay cache. Its key includes Google profile, wire model, session, function name, and canonical arguments. Only signatures that match the provider signature shape are retained; synthetic OpenAI item/call IDs are rejected as signatures.
+The persistence file is `<state-root>/antigravity/continuity.json`. Writes use a temporary file, `fsync`, and atomic replacement; Unix mode is `0600`. It contains continuity metadata and provider thought signatures, but no OAuth access/refresh tokens, Cloud Code Assist project binding, raw prompt text, tool output, or raw tool arguments (only an argument digest).
 
 Properties:
 
 ```text
-memory only
-bounded entry count
-TTL + LRU eviction
+persistent across normal router/container restart
+7-day sliding idle window
+30-day absolute retention
+session-level eviction
 profile isolated
-no raw prompt storage
-cleared on process exit
+no OAuth tokens or raw prompt/tool-result storage
 ```
 
-A signature-related upstream 400 clears that session's signature and call-handle state rather than recycling it across later turns.
+A signature-related upstream 400 is returned as `invalid_tool_signature` without destructively clearing the entire conversation's continuity state.
 
 ### Google tool schema transformation
 

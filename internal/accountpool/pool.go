@@ -149,6 +149,19 @@ func (l *Lease) Select(preferred, selector string, candidates []string, history 
 	return id, nil
 }
 
+// RestoreProfile rehydrates persisted provider affinity before selection.
+// It never overwrites a live, conflicting session binding.
+func (l *Lease) RestoreProfile(profile string) error {
+	if profile == "" {
+		return nil
+	}
+	if l.e.profile != "" && l.e.profile != profile {
+		return ErrContinuity
+	}
+	l.e.profile = profile
+	return nil
+}
+
 func (l *Lease) SetModel(model string) { l.model = model }
 func (l *Lease) quotaKey(profile string) string {
 	return l.provider + "\x00" + l.model + "\x00" + profile

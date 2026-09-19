@@ -29,8 +29,9 @@ func translateCCAStream(w http.ResponseWriter, body io.Reader, externalModel, wi
 	usage := map[string]any{}
 	sawData := false
 	sawTerminal := false
-	pendingSignature := ""
+	pendingSignatures := map[int]string{}
 	seenCalls := map[string]bool{}
+	callPositions := map[int]int{}
 
 	fail := func(message string) error {
 		writeSSE(w, map[string]any{"type": "response.failed", "response": map[string]any{
@@ -71,7 +72,7 @@ func translateCCAStream(w http.ResponseWriter, body io.Reader, externalModel, wi
 		if !ok {
 			return fail("Google Antigravity returned invalid candidates.")
 		}
-		for _, rawCandidate := range candidates {
+		for candidateIndex, rawCandidate := range candidates {
 			candidate, ok := rawCandidate.(map[string]any)
 			if !ok {
 				return fail("Google Antigravity returned an invalid candidate.")
@@ -99,7 +100,7 @@ func translateCCAStream(w http.ResponseWriter, body io.Reader, externalModel, wi
 				signature := thoughtSignature(part)
 				if thought, _ := part["thought"].(bool); thought {
 					if isLikelyRealThoughtSignature(signature) {
-						pendingSignature = signature
+						pendingSignatures[candidateIndex] = signature
 					}
 					continue
 				}
@@ -140,13 +141,20 @@ func translateCCAStream(w http.ResponseWriter, body io.Reader, externalModel, wi
 					itemID := "fc_ag_" + randomHex(10)
 					index := nextOutputIndex
 					nextOutputIndex++
-					if !isLikelyRealThoughtSignature(signature) {
-						signature = pendingSignature
+					callSignature := signature
+					if !isLikelyRealThoughtSignature(callSignature) {
+						callSignature = pendingSignatures[candidateIndex]
 					}
-					if isLikelyRealThoughtSignature(signature) {
-						replay.Remember(profileID, wireModel, session, name, args, signature)
+					if isLikelyRealThoughtSignature(callSignature) {
+						replay.Remember(profileID, wireModel, session, name, args, callSignature)
 					}
-					replay.RememberCall(callID, wireCallID, profileID, wireModel, session, name, args, signature)
+					stepID := fmt.Sprintf("%s:%d", responseID, candidateIndex)
+					position := callPositions[candidateIndex]
+					callPositions[candidateIndex] = position + 1
+					replay.RememberCall(callID, wireCallID, profileID, wireModel, session, name, args, callSignature, stepID, position)
+					// A pending thought signature belongs to the first function call in
+					// this model step. Parallel sibling calls must not duplicate it.
+					delete(pendingSignatures, candidateIndex)
 					writeSSE(w, map[string]any{"type": "response.output_item.added", "output_index": index, "item": map[string]any{
 						"id": itemID, "type": "function_call", "status": "in_progress", "call_id": callID, "name": name, "arguments": "",
 					}})
