@@ -40,10 +40,15 @@ func TestGoogleSchemaSupportedForms(t *testing.T) {
 		`{"definitions":{"Text":{"type":"string"}},"type":"array","items":{"$ref":"#/definitions/Text"}}`,
 		`{"type":["string","null"],"enum":["a","b"],"const":"b"}`,
 		`{"anyOf":[{"type":"string"},{"type":"null"}]}`,
+		`{"oneOf":[{"type":"string","enum":["all"]},{"type":"string","pattern":"^[1-9][0-9]*$"}]}`,
 		`{"type":"object","additionalProperties":{"type":"string"}}`,
 	} {
-		if _, err := transformGoogleSchema(schemaJSON(t, source)); err != nil {
+		out, err := transformGoogleSchema(schemaJSON(t, source))
+		if err != nil {
 			t.Fatal(source, err)
+		}
+		if strings.Contains(source, "oneOf") && out["anyOf"] == nil {
+			t.Fatalf("expected oneOf to map to anyOf: %v", out)
 		}
 	}
 }

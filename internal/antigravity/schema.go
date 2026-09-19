@@ -79,7 +79,7 @@ func (t *schemaTransform) schema(raw any, depth int) (map[string]any, error) {
 		}
 		for k, v := range s {
 			switch k {
-			case "$ref", "$defs", "definitions", "$schema", "$id", "default", "examples":
+			case "$ref", "$defs", "definitions", "$schema", "$id", "default", "examples", "example", "$comment", "deprecated", "readOnly", "writeOnly", "uniqueItems", "const":
 			case "description", "title":
 				if _, ok := v.(string); !ok {
 					return nil, fmt.Errorf("invalid schema annotation")
@@ -102,7 +102,7 @@ func (t *schemaTransform) schema(raw any, depth int) (map[string]any, error) {
 	for _, k := range keys {
 		v := s[k]
 		switch k {
-		case "$schema", "$id", "$defs", "definitions", "default", "examples", "uniqueItems", "const":
+		case "$schema", "$id", "$defs", "definitions", "default", "examples", "example", "$comment", "deprecated", "readOnly", "writeOnly", "uniqueItems", "const":
 			continue
 		case "properties":
 			props, ok := v.(map[string]any)
@@ -130,10 +130,10 @@ func (t *schemaTransform) schema(raw any, depth int) (map[string]any, error) {
 				return nil, err
 			}
 			out[k] = child
-		case "anyOf":
+		case "anyOf", "oneOf":
 			items, ok := v.([]any)
 			if !ok || len(items) == 0 {
-				return nil, fmt.Errorf("anyOf must be a nonempty array")
+				return nil, fmt.Errorf("%s must be a nonempty array", k)
 			}
 			clean := make([]any, 0, len(items))
 			for _, item := range items {
@@ -143,7 +143,11 @@ func (t *schemaTransform) schema(raw any, depth int) (map[string]any, error) {
 				}
 				clean = append(clean, child)
 			}
-			out[k] = clean
+			if existing, ok := out["anyOf"].([]any); ok {
+				out["anyOf"] = append(existing, clean...)
+			} else {
+				out["anyOf"] = clean
+			}
 		case "additionalProperties":
 			if flag, ok := v.(bool); ok {
 				out[k] = flag

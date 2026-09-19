@@ -154,7 +154,6 @@ func translateCCAStream(w http.ResponseWriter, body io.Reader, externalModel, wi
 					item := map[string]any{"id": itemID, "type": "function_call", "status": "completed", "call_id": callID, "name": name, "arguments": string(encodedArgs)}
 					writeSSE(w, map[string]any{"type": "response.output_item.done", "output_index": index, "item": item})
 					output = append(output, item)
-					pendingSignature = ""
 				}
 			}
 		}

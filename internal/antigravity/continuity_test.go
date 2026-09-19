@@ -416,3 +416,64 @@ func TestInvalidSchemaAndSelectorRejectedBeforeUpstream(t *testing.T) {
 		t.Fatal("invalid input reached upstream", calls)
 	}
 }
+
+func TestMultiToolCallsPreserveSignatureAcrossAllCalls(t *testing.T) {
+	_, broker := testRegistry(t)
+	multiToolStream := "data: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[" +
+		"{\"thought\":true,\"thoughtSignature\":\"" + testSignature + "\"}," +
+		"{\"functionCall\":{\"id\":\"wire_1\",\"name\":\"read_file\",\"args\":{\"path\":\"a.txt\"}}}," +
+		"{\"functionCall\":{\"id\":\"wire_2\",\"name\":\"read_file\",\"args\":{\"path\":\"b.txt\"}}}" +
+		"]}}]}}\n\n"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(body), "functionResponse") {
+			contents := string(body)
+			if strings.Count(contents, testSignature) < 2 {
+				t.Errorf("expected both tool calls to have thoughtSignature, body: %s", contents)
+			}
+			io.WriteString(w, textStream)
+		} else {
+			io.WriteString(w, multiToolStream)
+		}
+	}))
+	defer server.Close()
+
+	c := New(broker)
+	c.BaseURL = server.URL
+	c.HTTP = server.Client()
+	h := testAPI(t, c)
+
+	first := apiCall(h, "/v1/responses", firstPayload, "", "")
+	if first.Code != 200 {
+		t.Fatal(first.Body.String())
+	}
+
+	var firstResp map[string]any
+	json.Unmarshal(first.Body.Bytes(), &firstResp)
+	output := firstResp["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("expected 2 tool calls in output, got %d", len(output))
+	}
+	call1 := output[0].(map[string]any)
+	call2 := output[1].(map[string]any)
+	id1 := call1["call_id"].(string)
+	id2 := call2["call_id"].(string)
+
+	nextTurn := map[string]any{
+		"model": "google-antigravity/gemini-3.8-flash",
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "read files"},
+			map[string]any{"type": "function_call", "call_id": id1, "name": "read_file", "arguments": `{"path":"a.txt"}`},
+			map[string]any{"type": "function_call_output", "call_id": id1, "output": "content a"},
+			map[string]any{"type": "function_call", "call_id": id2, "name": "read_file", "arguments": `{"path":"b.txt"}`},
+			map[string]any{"type": "function_call_output", "call_id": id2, "output": "content b"},
+		},
+	}
+	nextTurnBytes, _ := json.Marshal(nextTurn)
+	second := apiCall(h, "/v1/responses", string(nextTurnBytes), "", "")
+	if second.Code != 200 {
+		t.Fatalf("status=%d body=%s", second.Code, second.Body.String())
+	}
+}
+

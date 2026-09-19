@@ -94,7 +94,8 @@ func responsesInputToGemini(raw any, profileID, model, session string, replay *R
 			callNames[callID] = name
 			wireID := callID
 			signature, found := replay.Lookup(profileID, model, session, name, args)
-			if strings.HasPrefix(callID, "call_ag_") {
+			isCallAg := strings.HasPrefix(callID, "call_ag_")
+			if isCallAg {
 				record, ok := replay.LookupCall(callID, model, name, args)
 				if !ok || record.profile != profileID || record.session != session {
 					return nil, "", fmt.Errorf("session_continuity_unavailable: invalid or expired tool call")
@@ -106,7 +107,7 @@ func responsesInputToGemini(raw any, profileID, model, session string, replay *R
 			part := map[string]any{"functionCall": map[string]any{"id": wireID, "name": name, "args": args}}
 			if found {
 				part["thoughtSignature"] = signature
-			} else if strings.Contains(strings.ToLower(model), "gemini") {
+			} else if !isCallAg && strings.Contains(strings.ToLower(model), "gemini") {
 				return nil, "", fmt.Errorf("session_continuity_unavailable: tool signature expired or conversation identity changed")
 			}
 			contents = append(contents, map[string]any{"role": "model", "parts": []any{part}})
