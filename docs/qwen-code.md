@@ -1,6 +1,27 @@
 # Qwen Code integration
 
-For `google-antigravity/*`, Qwen must echo the router-returned opaque `call_id` with the unchanged function name and arguments. The router recovers the original conversation/account even when Qwen sends no conversation header. It never groups conversations by their first prompt text. Antigravity continuity is persisted under the router state root and survives a normal container/router restart. The default idle window is seven days with a 30-day absolute cap; if continuity is genuinely outside retention or a current handle is altered, start a new conversation when `session_continuity_unavailable` is returned.
+For `google-antigravity/*`, Qwen must echo the router-returned opaque `call_id` with the unchanged function name and arguments (except the verified plan-reference replacement described below). The router recovers the original conversation/account even when Qwen sends no conversation header. It never groups conversations by their first prompt text. Antigravity continuity is persisted under the router state root and survives a normal container/router restart. If Qwen changes a reasoning-effort setting while the current signed tool chain is still active (for example around an interactive mode transition), the router keeps the wire-model variant that created those tool calls rather than treating them as expired. A real model-family change still requires new continuity. The default idle window is seven days with a 30-day absolute cap; if continuity is genuinely outside retention or a current handle is altered, start a new conversation when `session_continuity_unavailable` is returned.
+
+### Plan approval and resume
+
+No Qwen installation patch is required. Qwen may replace the `plan` argument of
+an approved `exit_plan_mode` call with its saved-plan reference. The router
+recognizes that specific replacement and restores the original provider-issued
+arguments before replaying the call with its original signature and wire ID.
+Every other argument must still match, and account, model, session, and expiry
+checks remain in force. The reference path is never opened by the router.
+
+The router persists original arguments only for `exit_plan_mode` calls in its
+private continuity state, subject to the same retention/eviction policy as the
+call itself. This includes the plan text; keep the state directory private.
+Normal calls still store argument digests only. Rebuild and recreate the Docker
+router to apply this change; clients on other PCs need no modification.
+
+Legacy records containing only a digest cannot reconstruct already-redacted
+plans. Such calls continue to fail closed unless their original arguments are
+recovered from a trusted transcript and verified against the existing digest.
+A fresh conversation also avoids legacy calls. Do not disable signature checks
+or invent replacement signatures to bypass a missing original.
 
 Clients may supply a unique `X-Client-Thread-Id` per conversation to retain account affinity across plain-text turns as well. Do not hardcode one shared ID for concurrent sessions. The local regression suite covers headerless Responses tool continuation, Chat translation, account changes, and signature restoration with a fake upstream; it is not a fresh credentialed Qwen/Google live test.
 

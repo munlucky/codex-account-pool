@@ -36,19 +36,30 @@ func explicitSessionID(r *http.Request, payload map[string]any) string {
 	return ""
 }
 
-func (c *Client) resolveSession(r *http.Request, payload map[string]any, model string) (string, error) {
-	if id := explicitSessionID(r, payload); id != "" {
-		return id, nil
-	}
+type continuityRoute struct {
+	session   string
+	wireModel string
+}
+
+func (c *Client) resolveContinuity(r *http.Request, payload map[string]any, requestedModel string) (continuityRoute, error) {
+	explicitSession := explicitSessionID(r, payload)
 	if !hasToolHistory(payload) {
-		return sessionID(r, payload), nil
+		session := explicitSession
+		if session == "" {
+			session = sessionID(r, payload)
+		}
+		return continuityRoute{session: session, wireModel: requestedModel}, nil
 	}
+
 	input, _ := payload["input"].([]any)
 	currentStart := currentTurnStart(input)
 
-	// Tool calls in the active user turn are strict: every router-issued handle
-	// must still resolve and all calls must belong to the same provider session.
-	session := ""
+	// The router-issued call handle is authoritative for the provider route that
+	// created an active tool step. This prevents a client-side reasoning-effort
+	// change from turning the same Gemini conversation into a different wire
+	// model in the middle of a signed function-calling turn.
+	session := explicitSession
+	wireModel := ""
 	currentCalls := 0
 	for i := currentStart; i < len(input); i++ {
 		item, _ := input[i].(map[string]any)
@@ -61,19 +72,28 @@ func (c *Client) resolveSession(r *http.Request, payload map[string]any, model s
 		if !strings.HasPrefix(id, "call_ag_") {
 			continue
 		}
-		record, ok := c.replay().LookupCall(id, model, name, args)
-		if !ok || (session != "" && record.session != session) {
-			return "", errors.New("session_continuity_unavailable")
+		record, ok := c.replay().LookupCallIdentity(id, name, args)
+		if !ok ||
+			(session != "" && record.session != session) ||
+			(wireModel != "" && record.model != wireModel) {
+			return continuityRoute{}, errors.New("session_continuity_unavailable")
 		}
-		session = record.session
+		if session == "" {
+			session = record.session
+		}
+		wireModel = record.model
 		currentCalls++
 	}
-	if currentCalls > 0 && session != "" {
-		return session, nil
+	if currentCalls > 0 {
+		if !sameContinuityModelFamily(requestedModel, wireModel) {
+			return continuityRoute{}, errors.New("session_continuity_unavailable")
+		}
+		return continuityRoute{session: session, wireModel: wireModel}, nil
 	}
 
-	// A fresh user turn may carry a long completed history. Recover identity from
-	// the newest surviving router handle, but do not make an expired old call fatal.
+	// A fresh user turn may carry a long completed history. Recover both the
+	// provider session and its last verified wire model from the newest surviving
+	// router handle. Missing old records are tolerated.
 	for i := currentStart - 1; i >= 0; i-- {
 		item, _ := input[i].(map[string]any)
 		if item == nil || item["type"] != "function_call" {
@@ -85,11 +105,41 @@ func (c *Client) resolveSession(r *http.Request, payload map[string]any, model s
 		}
 		name, _ := item["name"].(string)
 		args, _ := item["arguments"].(string)
-		if record, ok := c.replay().LookupCall(id, model, name, args); ok {
-			return record.session, nil
+		record, ok := c.replay().LookupCallIdentity(id, name, args)
+		if !ok {
+			continue
+		}
+		if explicitSession != "" && record.session != explicitSession {
+			continue
+		}
+		if !sameContinuityModelFamily(requestedModel, record.model) {
+			return continuityRoute{}, errors.New("session_continuity_unavailable")
+		}
+		return continuityRoute{session: record.session, wireModel: record.model}, nil
+	}
+
+	if explicitSession != "" {
+		return continuityRoute{session: explicitSession, wireModel: requestedModel}, nil
+	}
+	return continuityRoute{}, errors.New("session_continuity_unavailable")
+}
+
+func sameContinuityModelFamily(requested, stored string) bool {
+	return continuityModelFamily(requested) == continuityModelFamily(stored)
+}
+
+func continuityModelFamily(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	for _, suffix := range []string{"-low", "-medium", "-high"} {
+		if strings.HasPrefix(model, "gemini-3.8-flash-") && strings.HasSuffix(model, suffix) {
+			return "gemini-3.8-flash"
 		}
 	}
-	return "", errors.New("session_continuity_unavailable")
+	switch model {
+	case "gemini-3.1-pro-low", "gemini-pro-agent":
+		return "gemini-3.1-pro"
+	}
+	return model
 }
 
 func hasToolHistory(payload map[string]any) bool {

@@ -31,6 +31,7 @@ type replayEntry struct {
 }
 
 type callRecord struct {
+	originalArgs                                     json.RawMessage
 	profile, model, session, name, wireID, signature string
 	step                                             string
 	position                                         int
@@ -70,6 +71,7 @@ type persistedReplayEntry struct {
 }
 
 type persistedCallRecord struct {
+	OriginalArgs                                             json.RawMessage `json:",omitempty"`
 	ID                                                       string
 	Profile, Model, Session, Name, WireID, Signature, StepID string
 	Position                                                 int
@@ -140,6 +142,9 @@ func (c *ReplayCache) RememberCall(id, wireID, profile, model, session, name str
 		profile: profile, model: model, session: session, name: name, wireID: wireID, signature: signature,
 		step: step, position: position, args: argsDigest(args), createdAt: now, usedAt: now,
 	}
+	if name == "exit_plan_mode" {
+		record.originalArgs = json.RawMessage(canonicalArgs(args))
+	}
 	record.expiresAt = c.extendExpiry(now, record.createdAt)
 	c.calls[id] = record
 	c.bindSessionLocked(profile, model, session, now)
@@ -147,6 +152,22 @@ func (c *ReplayCache) RememberCall(id, wireID, profile, model, session, name str
 }
 
 func (c *ReplayCache) LookupCall(id, model, name string, args any) (callRecord, bool) {
+	record, ok := c.lookupCallIdentity(id, name, args)
+	if !ok || record.model != model {
+		return callRecord{}, false
+	}
+	return record, true
+}
+
+// LookupCallIdentity validates the opaque router call handle, function name,
+// and canonical arguments without requiring the caller to already know the
+// provider wire-model variant that created the call. The returned model is the
+// continuity authority for that conversation.
+func (c *ReplayCache) LookupCallIdentity(id, name string, args any) (callRecord, bool) {
+	return c.lookupCallIdentity(id, name, args)
+}
+
+func (c *ReplayCache) lookupCallIdentity(id, name string, args any) (callRecord, bool) {
 	if c == nil {
 		return callRecord{}, false
 	}
@@ -160,7 +181,7 @@ func (c *ReplayCache) LookupCall(id, model, name string, args any) (callRecord, 
 		}
 		return callRecord{}, false
 	}
-	if record.model != model || record.name != name || record.args != argsDigest(args) {
+	if record.name != name || !matchesCallArgs(record, args) {
 		return callRecord{}, false
 	}
 	record.usedAt = now
@@ -442,8 +463,12 @@ func (c *ReplayCache) load() error {
 		}
 	}
 	for _, item := range state.Calls {
+		if len(item.OriginalArgs) > 0 && (item.Name != "exit_plan_mode" || argsDigest(string(item.OriginalArgs)) != item.Args) {
+			return fmt.Errorf("invalid persisted plan replay arguments")
+		}
 		c.calls[item.ID] = callRecord{
-			profile: item.Profile, model: item.Model, session: item.Session, name: item.Name, wireID: item.WireID,
+			originalArgs: item.OriginalArgs,
+			profile:      item.Profile, model: item.Model, session: item.Session, name: item.Name, wireID: item.WireID,
 			signature: item.Signature, step: item.StepID, position: item.Position, args: item.Args,
 			createdAt: item.CreatedAt, expiresAt: item.ExpiresAt, usedAt: item.UsedAt,
 		}
@@ -471,7 +496,8 @@ func (c *ReplayCache) persistLocked() error {
 	}
 	for id, record := range c.calls {
 		state.Calls = append(state.Calls, persistedCallRecord{
-			ID: id, Profile: record.profile, Model: record.model, Session: record.session, Name: record.name, WireID: record.wireID,
+			OriginalArgs: record.originalArgs,
+			ID:           id, Profile: record.profile, Model: record.model, Session: record.session, Name: record.name, WireID: record.wireID,
 			Signature: record.signature, StepID: record.step, Position: record.position, Args: record.args,
 			CreatedAt: record.createdAt, ExpiresAt: record.expiresAt, UsedAt: record.usedAt,
 		})

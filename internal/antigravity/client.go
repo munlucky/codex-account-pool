@@ -92,13 +92,15 @@ func (c *Client) ServeResponses(w http.ResponseWriter, r *http.Request, upstream
 		c.end(requestID, surface, started, http.StatusBadRequest, "local", observability.OutcomeLocalResponse, observability.SemanticFailed)
 		return
 	}
-	wireModel, _ := resolveWireModel(upstreamModel, reasoningEffort(payload))
-	session, sessionErr := c.resolveSession(r, payload, wireModel)
-	if sessionErr != nil || session == "" {
+	requestedWireModel, _ := resolveWireModel(upstreamModel, reasoningEffort(payload))
+	route, sessionErr := c.resolveContinuity(r, payload, requestedWireModel)
+	if sessionErr != nil || route.session == "" || route.wireModel == "" {
 		writeAPIError(w, 503, "session_continuity_unavailable", "Conversation identity or tool replay has expired; start a new conversation.")
 		c.end(requestID, surface, started, 503, "local", observability.OutcomeLocalResponse, observability.SemanticFailed)
 		return
 	}
+	session := route.session
+	wireModel := route.wireModel
 	lease, credentials, err := c.acquireAccount(r.Context(), session, wireModel, openaiapi.RequestRoute(r).AccountSelector, hasToolHistory(payload))
 	if err != nil {
 		category := "account_unavailable"
@@ -110,7 +112,7 @@ func (c *Client) ServeResponses(w http.ResponseWriter, r *http.Request, upstream
 		return
 	}
 	defer lease.policy.Release()
-	prepared, err := prepareRequest(payload, upstreamModel, session, credentials.ProfileID, c.replay())
+	prepared, err := prepareRequestForWireModel(payload, upstreamModel, wireModel, session, credentials.ProfileID, c.replay())
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		c.end(requestID, surface, started, http.StatusBadRequest, "local", observability.OutcomeLocalResponse, observability.SemanticFailed)

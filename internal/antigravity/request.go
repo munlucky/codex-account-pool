@@ -12,7 +12,12 @@ type preparedRequest struct {
 }
 
 func prepareRequest(payload map[string]any, upstreamModel, session, profileID string, replay *ReplayCache) (preparedRequest, error) {
-	wireModel, thinkingLevel := resolveWireModel(upstreamModel, reasoningEffort(payload))
+	wireModel, _ := resolveWireModel(upstreamModel, reasoningEffort(payload))
+	return prepareRequestForWireModel(payload, upstreamModel, wireModel, session, profileID, replay)
+}
+
+func prepareRequestForWireModel(payload map[string]any, upstreamModel, wireModel, session, profileID string, replay *ReplayCache) (preparedRequest, error) {
+	_, thinkingLevel := resolveWireModel(upstreamModel, reasoningEffort(payload))
 	contents, systemText, err := responsesInputToGemini(payload["input"], profileID, wireModel, session, replay)
 	if err != nil {
 		return preparedRequest{}, err
@@ -142,6 +147,11 @@ func responsesInputToGemini(raw any, profileID, model, session string, replay *R
 						return nil, "", fmt.Errorf("session_continuity_unavailable: current tool call is invalid or expired")
 					}
 				} else {
+					if len(record.originalArgs) > 0 {
+						if err := json.Unmarshal(record.originalArgs, &args); err != nil {
+							return nil, "", fmt.Errorf("session_continuity_unavailable: invalid stored plan arguments")
+						}
+					}
 					wireID = record.wireID
 					signature = record.signature
 					foundSignature = signature != ""

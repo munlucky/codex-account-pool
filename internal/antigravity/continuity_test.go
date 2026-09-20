@@ -149,6 +149,91 @@ func TestAPIFailoverPreservesNextTurnSignatureAndFreshCredentials(t *testing.T) 
 	}
 }
 
+func TestHeaderlessToolContinuationPinsWireModelAcrossReasoningEffortChange(t *testing.T) {
+	_, broker := testRegistry(t)
+	var mu sync.Mutex
+	var wireModels []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		wireModels = append(wireModels, body["model"].(string))
+		call := len(wireModels)
+		mu.Unlock()
+		if call == 1 {
+			io.WriteString(w, toolStream)
+			return
+		}
+		encoded, _ := json.Marshal(body)
+		if !strings.Contains(string(encoded), testSignature) {
+			t.Errorf("continuation lost thought signature: %s", string(encoded))
+		}
+		io.WriteString(w, textStream)
+	}))
+	defer server.Close()
+
+	c := New(broker)
+	c.BaseURL = server.URL
+	c.HTTP = server.Client()
+	h := testAPI(t, c)
+
+	first := apiCall(h, "/v1/responses", firstPayload, "", "")
+	if first.Code != 200 {
+		t.Fatal(first.Code, first.Body.String())
+	}
+	callID := returnedCallID(t, first)
+
+	var secondPayload map[string]any
+	if err := json.Unmarshal([]byte(strings.ReplaceAll(nextPayload, "call_1", callID)), &secondPayload); err != nil {
+		t.Fatal(err)
+	}
+	secondPayload["reasoning"] = map[string]any{"effort": "high"}
+	rawSecond, _ := json.Marshal(secondPayload)
+
+	second := apiCall(h, "/v1/responses", string(rawSecond), "", "")
+	if second.Code != 200 {
+		t.Fatal(second.Code, second.Body.String())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(wireModels, ",") != "gemini-3.8-flash-medium,gemini-3.8-flash-medium" {
+		t.Fatalf("wire model drifted across active tool continuity: %v", wireModels)
+	}
+}
+
+func TestCurrentToolContinuityRejectsDifferentModelFamily(t *testing.T) {
+	replay := NewReplayCache(16, time.Hour)
+	args := map[string]any{"city": "Seoul"}
+	replay.RememberCall(
+		"call_ag_model_pin",
+		"wire_1",
+		"google-1",
+		"gemini-3.8-flash-medium",
+		"-session",
+		"weather",
+		args,
+		testSignature,
+		"step-1",
+		0,
+	)
+	c := New(nil)
+	c.Replay = replay
+	payload := map[string]any{
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "question"},
+			map[string]any{"type": "function_call", "call_id": "call_ag_model_pin", "name": "weather", "arguments": "{\"city\":\"Seoul\"}"},
+			map[string]any{"type": "function_call_output", "call_id": "call_ag_model_pin", "output": "sunny"},
+		},
+	}
+
+	if _, err := c.resolveContinuity(nil, payload, "gemini-3.7-flash-tiered"); err == nil {
+		t.Fatal("different model family reused signed tool continuity")
+	}
+}
+
 func TestHeaderlessToolHandlesPreserveIndependentConversations(t *testing.T) {
 	store, broker := testRegistry(t)
 	var tokens []string
