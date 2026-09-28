@@ -14,16 +14,16 @@ The project is not designed to be exposed to a LAN, the public internet, or mult
 
 ## Credential ownership and storage
 
-The host setup script invokes the official Codex login flow with a dedicated `CODEX_HOME` for each profile and `cli_auth_credentials_store="file"`. Profile state is kept under the platform state directory:
+The Docker router owns Codex login. It runs the bundled official Codex app-server with a dedicated `CODEX_HOME` and `cli_auth_credentials_store="file"` for each profile. Profile state is kept under the platform state directory:
 
 ```text
 Windows: %APPDATA%\GPTCodexRouter\profiles\codex\<profile>
 macOS:   ~/Library/Application Support/GPTCodexRouter/profiles/codex/<profile>
 ```
 
-The router reads the selected profile's Codex `auth.json` only to authenticate ChatGPT backend requests and maintain that same profile's OAuth refresh lifecycle. Three separate local credentials live at the state root: `client-key` for `/v1/*`, `admin-key` for creating browser administrator sessions, and `worker-key` for `/admin/worker/*`. None is used as upstream ChatGPT authentication, and they are not interchangeable. The state root also stores `codex-client-version`, which is non-secret compatibility metadata used by `/v1/models`. Existing installations may point the repository-local Compose `.env` at a legacy/custom state root; treat that selected root as the credential boundary and do not silently migrate it.
+The router reads the selected profile's Codex `auth.json` only to authenticate ChatGPT backend requests and maintain that same profile's OAuth refresh lifecycle. Two separate local credentials live at the state root: `client-key` for `/v1/*` and `admin-key` for creating browser administrator sessions. Neither is used as upstream ChatGPT authentication, and they are not interchangeable. In Docker mode the Codex compatibility version comes from the checksum-pinned Codex runtime built into the image. Existing installations may point the repository-local Compose `.env` at a legacy/custom state root; setup preserves that selected root rather than silently creating a second credential store.
 
-The host worker may create a transient `profiles/codex/<profile>/.gcr-login-backup.json` containing the previous `auth.json` bytes while a login result is unsettled. It is credential material: the file is mode `0600` on Unix, remains inside that profile home, is never returned by an API or written to logs, and is deleted after success or after a failed/canceled login is restored. A restarted worker reconciles it only against the persisted bounded job state and never guesses when job state is unavailable.
+The container-owned login runtime may create a transient `profiles/codex/<profile>/.gcr-login-backup.json` containing the previous `auth.json` bytes while a login result is unsettled. It is credential material: the file is mode `0600` on Unix, remains inside that profile home, is never returned by an API or written to logs, and is deleted after success or after a failed/canceled login is restored. After a container restart, the router reconciles it only against persisted bounded job state and never guesses when job state is unavailable.
 
 The project must never:
 
@@ -53,13 +53,13 @@ Additional container controls:
 - `no-new-privileges` is enabled;
 - `/healthz` is unauthenticated but contains no credential data and never contacts ChatGPT.
 
-Only one router service should own the routing state root. Post-install Codex login is performed by the host worker while the container remains running; OAuth refresh and host login share a profile-scoped filesystem write lock so `auth.json` writers for the same profile are serialized without blocking unrelated profiles. Initial setup retains the legacy pre-start login flow.
+Only one router service should own the routing state root. Codex device-code login and OAuth refresh both run under the router's profile-scoped filesystem write lock, so `auth.json` writers for the same profile are serialized without blocking unrelated profiles. The host browser only approves the device code; it does not own or write the profile credential file.
 
 ## Upstream request sanitization
 
 `/backend-api` and `/backend-api/*` remain the Codex passthrough routes. `/v1/responses`, `/v1/chat/completions`, and `/v1/models` are local compatibility routes and require `Authorization: Bearer <client-key>`. The compatibility layer removes that local authorization header before handing a request to the backend gateway. Before any upstream request is sent, the gateway removes inbound authentication-bearing headers and attaches only the credentials selected from local profile state.
 
-The local `GET /healthz` route is handled without reading profile credentials or contacting ChatGPT. `/admin/*` is a separate management surface: profile data requires an administrator session, mutating browser requests additionally require same-origin and CSRF validation, and `/admin/worker/*` accepts only the worker key. The unauthenticated `/admin` HTML shell contains no profile or credential data.
+The local `GET /healthz` route is handled without reading profile credentials or contacting ChatGPT. `/admin/*` is a separate management surface: profile data requires an administrator session and mutating browser requests additionally require same-origin and CSRF validation. The previous `/admin/worker/*` surface no longer exists. The unauthenticated `/admin` HTML shell contains no profile or credential data.
 
 ## Local OpenAI-compatible API
 
@@ -84,7 +84,7 @@ The broker refreshes an access token only when it is near expiration. Refresh be
 - refresh never causes profile failover;
 - successful updates are written atomically back to the same profile auth file.
 
-After initial setup, use the loopback administrator UI and host worker to sign in again without stopping the router. The initial setup scripts remain available only for bootstrap/reconfiguration.
+Use the loopback administrator UI for new Codex accounts and re-authentication. Device login is started by the running container and displays only the HTTPS verification URL and user code needed for browser approval. No background host worker is required.
 
 ## Profile selection and usage-limit failover
 
@@ -119,7 +119,7 @@ The router returns HTTP 426 only for the `/backend-api/codex/responses` WebSocke
 
 ## Child-process environment
 
-Native CLI login/status/run operations use an isolated `CODEX_HOME` and remove known API-key/token override variables before launching Codex. Both platform setup scripts apply the same isolation when invoking the official login command.
+The container-owned Codex login runtime uses an isolated profile `CODEX_HOME`, forces file-backed credential storage, and removes known API-key/token override variables before launching the bundled Codex app-server. App-server stderr is discarded and provider error bodies are not reflected through the administrator API. Native CLI status/run operations retain the same `CODEX_HOME` isolation.
 
 ## Context Observability data policy
 

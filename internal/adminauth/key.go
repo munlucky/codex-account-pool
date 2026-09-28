@@ -11,36 +11,12 @@ import (
 	"strings"
 )
 
-const (
-	adminKeyFile  = "admin-key"
-	workerKeyFile = "worker-key"
-)
+const adminKeyFile = "admin-key"
 
-func AdminKeyPath(root string) string  { return filepath.Join(root, adminKeyFile) }
-func WorkerKeyPath(root string) string { return filepath.Join(root, workerKeyFile) }
+func AdminKeyPath(root string) string { return filepath.Join(root, adminKeyFile) }
 
 func EnsureAdminKey(root string) (string, error) {
 	return ensure(root, adminKeyFile, "gcr_admin_")
-}
-
-func EnsureWorkerKey(root string) (string, error) {
-	return ensure(root, workerKeyFile, "gcr_worker_")
-}
-
-func LoadWorkerKey(root string) (string, error) {
-	return read(WorkerKeyPath(root), "gcr_worker_")
-}
-
-func MatchesBearer(header, key string) bool {
-	const prefix = "Bearer "
-	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
-		return false
-	}
-	candidate := strings.TrimSpace(header[len(prefix):])
-	if candidate == "" || key == "" || len(candidate) != len(key) {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(candidate), []byte(key)) == 1
 }
 
 func MatchesKey(candidate, key string) bool {

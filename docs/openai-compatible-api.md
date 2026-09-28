@@ -275,7 +275,7 @@ Codex models come from:
 /backend-api/codex/models?client_version=<detected-version>
 ```
 
-using the managed `codex-client-version` metadata or an existing Codex model cache fallback.
+using the Codex runtime version pinned in the Docker image; native/legacy runs can still fall back to managed `codex-client-version` metadata or an existing Codex model cache.
 
 Antigravity models are discovered lazily with:
 

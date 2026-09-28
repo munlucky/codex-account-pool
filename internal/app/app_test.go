@@ -3,12 +3,12 @@ package app
 import (
 	"bytes"
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	processpkg "github.com/munlucky/codex-account-pool/internal/process"
 	"github.com/munlucky/codex-account-pool/internal/profile"
@@ -33,41 +33,40 @@ func newTestApp(t *testing.T) (*App, *fakeExecutor, *bytes.Buffer) {
 	return a, exec, out
 }
 
-func TestCodexAuthFlowUsesIsolatedFileBackedCodexHome(t *testing.T) {
-	a, exec, _ := newTestApp(t)
-	ctx := context.Background()
-	if err := a.Execute(ctx, []string{"auth", "add", "codex", "account-1"}); err != nil {
+func registerCodexProfile(t *testing.T, a *App, id string) {
+	t.Helper()
+	registry, err := a.Store.Load()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(exec.commands) != 1 {
-		t.Fatalf("commands=%d", len(exec.commands))
+	if err := registry.Add(profile.Profile{ID: id, Provider: profile.ProviderCodex, Isolation: "codex-home"}); err != nil {
+		t.Fatal(err)
 	}
-	login := exec.commands[0]
-	if login.Executable != "fake-codex" || strings.Join(login.Args, " ") != `-c cli_auth_credentials_store="file" login` {
-		t.Fatalf("unexpected login command: %+v", login)
+	if err := a.Store.Save(registry); err != nil {
+		t.Fatal(err)
 	}
-	if login.SetEnv["CODEX_HOME"] != a.Store.CodexHome("account-1") {
-		t.Fatalf("CODEX_HOME=%q", login.SetEnv["CODEX_HOME"])
-	}
-	unset := strings.Join(login.UnsetEnv, ",")
-	for _, secretEnv := range []string{"OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"} {
-		if !strings.Contains(unset, secretEnv) {
-			t.Fatalf("%s was not stripped: %v", secretEnv, login.UnsetEnv)
-		}
-	}
+}
+
+func TestCodexStatusAndRunUseIsolatedFileBackedCodexHome(t *testing.T) {
+	a, exec, _ := newTestApp(t)
+	registerCodexProfile(t, a, "account-1")
+	ctx := context.Background()
 
 	if err := a.Execute(ctx, []string{"auth", "status", "codex"}); err != nil {
 		t.Fatal(err)
 	}
-	status := exec.commands[1]
+	status := exec.commands[0]
 	if strings.Join(status.Args, " ") != `-c cli_auth_credentials_store="file" login status` {
 		t.Fatalf("unexpected status command: %+v", status)
+	}
+	if status.SetEnv["CODEX_HOME"] != a.Store.CodexHome("account-1") {
+		t.Fatalf("CODEX_HOME=%q", status.SetEnv["CODEX_HOME"])
 	}
 
 	if err := a.Execute(ctx, []string{"run", "codex", "--", "--model", "gpt-test"}); err != nil {
 		t.Fatal(err)
 	}
-	run := exec.commands[2]
+	run := exec.commands[1]
 	if strings.Join(run.Args, " ") != `-c cli_auth_credentials_store="file" --model gpt-test` || run.SetEnv["CODEX_HOME"] != a.Store.CodexHome("account-1") {
 		t.Fatalf("unexpected run command: %+v", run)
 	}
@@ -75,15 +74,9 @@ func TestCodexAuthFlowUsesIsolatedFileBackedCodexHome(t *testing.T) {
 
 func TestCodexProfilesSwitchManually(t *testing.T) {
 	a, exec, out := newTestApp(t)
+	registerCodexProfile(t, a, "one")
+	registerCodexProfile(t, a, "two")
 	ctx := context.Background()
-	for _, id := range []string{"one", "two"} {
-		if err := a.Execute(ctx, []string{"auth", "add", "codex", id}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if exec.commands[0].SetEnv["CODEX_HOME"] == exec.commands[1].SetEnv["CODEX_HOME"] {
-		t.Fatal("codex profiles must have independent CODEX_HOME values")
-	}
 	out.Reset()
 	if err := a.Execute(ctx, []string{"auth", "use", "codex", "two"}); err != nil {
 		t.Fatal(err)
@@ -94,22 +87,20 @@ func TestCodexProfilesSwitchManually(t *testing.T) {
 	if err := a.Execute(ctx, []string{"run", "codex"}); err != nil {
 		t.Fatal(err)
 	}
-	if got := exec.commands[2].SetEnv["CODEX_HOME"]; got != a.Store.CodexHome("two") {
+	if got := exec.commands[0].SetEnv["CODEX_HOME"]; got != a.Store.CodexHome("two") {
 		t.Fatalf("run used CODEX_HOME=%q", got)
 	}
 }
 
-func TestCodexExistingProfileCanLoginAgain(t *testing.T) {
-	a, exec, _ := newTestApp(t)
+func TestCodexLoginCommandsRedirectToAdministratorUI(t *testing.T) {
+	a, _, _ := newTestApp(t)
 	ctx := context.Background()
-	if err := a.Execute(ctx, []string{"auth", "add", "codex", "one"}); err != nil {
-		t.Fatal(err)
+	if err := a.Execute(ctx, []string{"auth", "add", "codex", "one"}); err == nil || !strings.Contains(err.Error(), "/admin") {
+		t.Fatalf("expected admin UI guidance, got %v", err)
 	}
-	if err := a.Execute(ctx, []string{"auth", "login", "codex", "one"}); err != nil {
-		t.Fatal(err)
-	}
-	if len(exec.commands) != 2 || strings.Join(exec.commands[1].Args, " ") != `-c cli_auth_credentials_store="file" login` {
-		t.Fatalf("unexpected re-login command: %+v", exec.commands)
+	registerCodexProfile(t, a, "one")
+	if err := a.Execute(ctx, []string{"auth", "login", "codex", "one"}); err == nil || !strings.Contains(err.Error(), "/admin") {
+		t.Fatalf("expected admin UI guidance, got %v", err)
 	}
 	if err := a.Execute(ctx, []string{"auth", "login", "codex", "missing"}); err == nil {
 		t.Fatal("expected missing profile error")
@@ -118,9 +109,7 @@ func TestCodexExistingProfileCanLoginAgain(t *testing.T) {
 
 func TestAuthListContainsNoCredentialValuesOrFields(t *testing.T) {
 	a, _, out := newTestApp(t)
-	if err := a.Execute(context.Background(), []string{"auth", "add", "codex", "one"}); err != nil {
-		t.Fatal(err)
-	}
+	registerCodexProfile(t, a, "one")
 	out.Reset()
 	if err := a.Execute(context.Background(), []string{"auth", "list"}); err != nil {
 		t.Fatal(err)
@@ -136,18 +125,17 @@ func TestAuthListContainsNoCredentialValuesOrFields(t *testing.T) {
 	}
 }
 
-func TestFailedCodexLoginDoesNotRegisterProfile(t *testing.T) {
-	a, exec, _ := newTestApp(t)
-	exec.err = errors.New("fake login failure")
+func TestCodexAuthAddDoesNotRegisterOutsideAdministratorFlow(t *testing.T) {
+	a, _, _ := newTestApp(t)
 	if err := a.Execute(context.Background(), []string{"auth", "add", "codex", "broken"}); err == nil {
-		t.Fatal("expected login failure")
+		t.Fatal("expected administrator UI guidance")
 	}
 	registry, err := a.Store.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := registry.Find(profile.ProviderCodex, "broken"); ok {
-		t.Fatal("failed login must not register the profile")
+		t.Fatal("Codex CLI auth add must not register the profile")
 	}
 }
 
@@ -359,5 +347,25 @@ func TestReportCommandReadsStructuredEventsFromStdin(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("report missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestServeStartsWithEmptyCodexRegistry(t *testing.T) {
+	t.Setenv("GPT_CODEX_ROUTER_CODEX_CLIENT_VERSION", "0.157.1")
+	a, _, _ := newTestApp(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- a.Execute(ctx, []string{"serve", "--listen", "127.0.0.1:0"})
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("empty-registry serve failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("empty-registry serve did not stop")
 	}
 }

@@ -150,6 +150,30 @@ func (r *Registry) Add(profile Profile) error {
 	return nil
 }
 
+func (r *Registry) Remove(provider, profileID string) error {
+	index := -1
+	for i, p := range r.Profiles {
+		if p.Provider == provider && p.ID == profileID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return fmt.Errorf("profile %s/%s not found", provider, profileID)
+	}
+	r.Profiles = append(r.Profiles[:index], r.Profiles[index+1:]...)
+	if r.Active != nil && r.Active[provider] == profileID {
+		delete(r.Active, provider)
+		for _, p := range r.Profiles {
+			if p.Provider == provider {
+				r.Active[provider] = p.ID
+				break
+			}
+		}
+	}
+	return nil
+}
+
 func (r *Registry) Use(provider, profileID string) error {
 	if _, ok := r.Find(provider, profileID); !ok {
 		return fmt.Errorf("profile %s/%s not found", provider, profileID)

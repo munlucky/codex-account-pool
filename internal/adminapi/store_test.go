@@ -16,77 +16,65 @@ func TestStateStoreBoundsTerminalJobHistory(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := store.CompleteCheck(job.ID, CheckRecord{
-			Status: StatusConnected, CheckedAt: time.Now().UTC(),
-		}); err != nil {
+		if err := store.CompleteCheck(job.ID, CheckRecord{Status: StatusConnected, CheckedAt: time.Now().UTC()}); err != nil {
 			t.Fatal(err)
 		}
 	}
-
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	terminal := 0
-	for _, job := range store.state.Jobs {
-		switch job.State {
-		case JobSucceeded, JobFailed, JobCanceled:
-			terminal++
-		}
-	}
-	if terminal != maxRetainedTerminalJobs {
-		t.Fatalf("terminal jobs=%d want=%d", terminal, maxRetainedTerminalJobs)
+	if len(store.state.Jobs) != maxRetainedTerminalJobs {
+		t.Fatalf("jobs=%d", len(store.state.Jobs))
 	}
 }
 
-func TestExpiredLoginLeaseCannotBeRevivedByHeartbeat(t *testing.T) {
+func TestLoginChallengeAndFinalizationTransitions(t *testing.T) {
 	store, err := OpenStateStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Unix(2_000_000_000, 0).UTC()
-	store.now = func() time.Time { return now }
-
 	job, err := store.CreateJob(JobTypeLogin, "codex", "account-1", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	leased, ok, err := store.LeaseLogin(20 * time.Second)
-	if err != nil || !ok || leased.ID != job.ID {
-		t.Fatalf("lease=%+v ok=%v err=%v", leased, ok, err)
+	job, err = store.SetLoginChallenge(job.ID, "https://auth.openai.com/codex/device", "ABCD-1234")
+	if err != nil {
+		t.Fatal(err)
 	}
-	now = now.Add(21 * time.Second)
-
-	got, err := store.Heartbeat(leased.ID, leased.LeaseID, 20*time.Second)
-	if err == nil {
-		t.Fatal("expired lease heartbeat must fail")
+	if job.State != JobLoggingIn || job.UserCode == "" {
+		t.Fatalf("challenge=%+v", job)
 	}
-	if got.State != JobFailed || got.ErrorCode != ErrWorkerRestarted || got.LeaseID != "" || !got.LeaseUntil.IsZero() {
-		t.Fatalf("expired heartbeat state=%+v", got)
+	job, err = store.BeginLoginFinalization(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.State != JobFinalizing || job.UserCode != "" {
+		t.Fatalf("finalizing=%+v", job)
+	}
+	job, err = store.FinishLogin(job.ID, true, "")
+	if err != nil || job.State != JobSucceeded {
+		t.Fatalf("finished=%+v err=%v", job, err)
 	}
 }
 
-func TestExpiredLoginLeaseCannotBeginCompletion(t *testing.T) {
-	store, err := OpenStateStore(t.TempDir())
+func TestRestartFailsContainerOwnedLogin(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStateStore(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Unix(2_000_000_000, 0).UTC()
-	store.now = func() time.Time { return now }
-
 	job, err := store.CreateJob(JobTypeLogin, "codex", "account-1", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	leased, ok, err := store.LeaseLogin(20 * time.Second)
-	if err != nil || !ok || leased.ID != job.ID {
-		t.Fatalf("lease=%+v ok=%v err=%v", leased, ok, err)
+	if _, err := store.SetLoginChallenge(job.ID, "https://auth.openai.com/codex/device", "ABCD-1234"); err != nil {
+		t.Fatal(err)
 	}
-	now = now.Add(21 * time.Second)
-
-	got, err := store.BeginLoginCompletion(leased.ID, leased.LeaseID)
-	if err == nil {
-		t.Fatal("expired lease completion must fail")
+	reopened, err := OpenStateStore(root)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got.State != JobFailed || got.ErrorCode != ErrWorkerRestarted || got.LeaseID != "" || !got.LeaseUntil.IsZero() {
-		t.Fatalf("expired completion state=%+v", got)
+	got, ok := reopened.Job(job.ID)
+	if !ok || got.State != JobFailed || got.ErrorCode != ErrServiceRestarted || got.UserCode != "" {
+		t.Fatalf("job=%+v ok=%v", got, ok)
 	}
 }

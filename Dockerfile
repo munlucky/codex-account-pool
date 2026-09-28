@@ -25,17 +25,28 @@ RUN resolved_commit="${COMMIT}"; \
     fi; \
     if [ -z "${resolved_commit}" ]; then resolved_commit="unknown"; fi; \
     ldflags="-s -w -X main.version=${VERSION} -X main.commit=${resolved_commit}"; \
-    CGO_ENABLED=0 go build \
-      -trimpath \
-      -ldflags="${ldflags}" \
-      -o /out/gpt-codex-router \
-      ./cmd/gpt-codex-router; \
-    mkdir -p /out/host-workers; \
-    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="${ldflags}" -o /out/host-workers/gpt-codex-router-darwin-arm64 ./cmd/gpt-codex-router; \
-    CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="${ldflags}" -o /out/host-workers/gpt-codex-router-darwin-amd64 ./cmd/gpt-codex-router; \
-    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="${ldflags}" -o /out/host-workers/gpt-codex-router-windows-amd64.exe ./cmd/gpt-codex-router
+    CGO_ENABLED=0 go build -trimpath -ldflags="${ldflags}" -o /out/gpt-codex-router ./cmd/gpt-codex-router
+
+FROM alpine:3.22 AS codex-runtime
+ARG CODEX_VERSION=0.157.1
+ARG TARGETARCH
+RUN apk add --no-cache ca-certificates curl tar \
+    && case "${TARGETARCH}" in \
+         amd64) triple='x86_64-unknown-linux-musl'; expected='e98c1e8e028e8137fa2d2415c82ec58e7b3701a627e3554aace5b3ca31454af2' ;; \
+         arm64) triple='aarch64-unknown-linux-musl'; expected='4c6b1c17c1c5fd0d4fb2951b7481867b95ea732b1feab269c98588b15db16253' ;; \
+         *) echo "unsupported Docker architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && archive="codex-${triple}.tar.gz" \
+    && curl -fsSL --retry 3 -o "/tmp/${archive}" "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/${archive}" \
+    && echo "${expected}  /tmp/${archive}" | sha256sum -c - \
+    && mkdir -p /out \
+    && tar -xzf "/tmp/${archive}" -C /out \
+    && mv "/out/codex-${triple}" /out/codex \
+    && chmod 0755 /out/codex \
+    && /out/codex --version
 
 FROM alpine:3.22
+ARG CODEX_VERSION=0.157.1
 
 LABEL org.opencontainers.image.title="GPT Codex Router" \
       org.opencontainers.image.description="Local ChatGPT subscription profile router for Codex" \
@@ -49,10 +60,11 @@ RUN apk add --no-cache ca-certificates \
     && chown 10001:10001 /data
 
 COPY --from=build /out/gpt-codex-router /usr/local/bin/gpt-codex-router
-COPY --from=build /out/host-workers /opt/gpt-codex-router/host-workers
+COPY --from=codex-runtime /out/codex /usr/local/bin/codex
 
 ENV GPT_CODEX_ROUTER_HOME=/data \
-    GPT_CODEX_ROUTER_CONTAINER=1
+    GPT_CODEX_ROUTER_CONTAINER=1 \
+    GPT_CODEX_ROUTER_CODEX_CLIENT_VERSION=${CODEX_VERSION}
 
 EXPOSE 8317
 USER 10001:10001

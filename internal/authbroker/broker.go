@@ -242,6 +242,7 @@ func (b *Broker) Failover(ctx context.Context, exhaustedProfileID string, resetA
 
 type ProfileAuthInfo struct {
 	ProfileID       string
+	AccountID       string
 	HasAuth         bool
 	HasAccessToken  bool
 	HasRefreshToken bool
@@ -265,8 +266,8 @@ func (b *Broker) InspectProfile(profileID string) (ProfileAuthInfo, error) {
 }
 
 // ValidateProfileAuth validates a Codex auth file without requiring that the
-// profile is already registered. The host worker uses it after a new login and
-// before registry mutation.
+// profile is already registered. The administrator login flow uses it after a
+// new device-code login and before registry mutation.
 func (b *Broker) ValidateProfileAuth(profileID string) (ProfileAuthInfo, error) {
 	if b == nil || b.Store == nil {
 		return ProfileAuthInfo{ProfileID: profileID}, errors.New("auth broker is not configured")
@@ -296,7 +297,8 @@ func (b *Broker) inspectAuthFile(profileID string) (ProfileAuthInfo, error) {
 	info.HasAuth = true
 	info.HasAccessToken = strings.TrimSpace(doc.Tokens.AccessToken) != ""
 	info.HasRefreshToken = strings.TrimSpace(doc.Tokens.RefreshToken) != ""
-	info.HasAccountID = strings.TrimSpace(doc.Tokens.AccountID) != ""
+	info.AccountID = strings.TrimSpace(doc.Tokens.AccountID)
+	info.HasAccountID = info.AccountID != ""
 	if exp, ok := jwtUnixClaim(doc.Tokens.AccessToken, "exp"); ok {
 		info.AccessExpiresAt = time.Unix(exp, 0).UTC()
 		info.AccessExpired = !info.AccessExpiresAt.After(b.now())

@@ -11,13 +11,12 @@ import (
 )
 
 type Handler struct {
-	Service   *Service
-	Sessions  *adminauth.Sessions
-	WorkerKey string
+	Service  *Service
+	Sessions *adminauth.Sessions
 }
 
-func NewHandler(service *Service, sessions *adminauth.Sessions, workerKey string) *Handler {
-	return &Handler{Service: service, Sessions: sessions, WorkerKey: workerKey}
+func NewHandler(service *Service, sessions *adminauth.Sessions) *Handler {
+	return &Handler{Service: service, Sessions: sessions}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -34,10 +33,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/admin/session" {
 		h.handleSession(w, r)
-		return
-	}
-	if strings.HasPrefix(r.URL.Path, "/admin/worker/") {
-		h.handleWorker(w, r)
 		return
 	}
 
@@ -59,13 +54,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, response)
-		return
 	case strings.HasPrefix(r.URL.Path, "/admin/profiles/"):
 		h.handleProfileAction(w, r)
-		return
 	case strings.HasPrefix(r.URL.Path, "/admin/jobs/"):
 		h.handleJob(w, r)
-		return
 	default:
 		http.NotFound(w, r)
 	}
@@ -176,100 +168,6 @@ func (h *Handler) handleJob(w http.ResponseWriter, r *http.Request) {
 	methodNotAllowed(w)
 }
 
-func (h *Handler) handleWorker(w http.ResponseWriter, r *http.Request) {
-	if !adminauth.MatchesBearer(r.Header.Get("Authorization"), h.WorkerKey) {
-		writeError(w, http.StatusUnauthorized, "worker_auth_required")
-		return
-	}
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w)
-		return
-	}
-	switch r.URL.Path {
-	case "/admin/worker/lease":
-		job, ok, err := h.Service.WorkerLease()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "worker_state_unavailable")
-			return
-		}
-		if !ok {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"job_id":      job.ID,
-			"provider":    job.Provider,
-			"profile_id":  job.ProfileID,
-			"new_profile": job.NewProfile,
-			"lease_id":    job.LeaseID,
-			"lease_until": job.LeaseUntil,
-		})
-		return
-	case "/admin/worker/diagnostics":
-		var input struct {
-			DesktopRoutingState string `json:"desktop_routing_state"`
-		}
-		if err := decodeJSON(r, &input); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request")
-			return
-		}
-		if err := h.Service.UpdateWorkerDiagnostics(input.DesktopRoutingState); err != nil {
-			writeError(w, http.StatusInternalServerError, "worker_state_unavailable")
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	rest := strings.TrimPrefix(r.URL.Path, "/admin/worker/jobs/")
-	parts := strings.Split(rest, "/")
-	if len(parts) != 2 || parts[0] == "" {
-		http.NotFound(w, r)
-		return
-	}
-	switch parts[1] {
-	case "status":
-		job, ok := h.Service.Job(parts[0])
-		if !ok {
-			writeError(w, http.StatusNotFound, "job_not_found")
-			return
-		}
-		writeJSON(w, http.StatusOK, job)
-	case "heartbeat":
-		var input struct {
-			LeaseID string `json:"lease_id"`
-		}
-		if err := decodeJSON(r, &input); err != nil || input.LeaseID == "" {
-			writeError(w, http.StatusBadRequest, "invalid_request")
-			return
-		}
-		job, err := h.Service.WorkerHeartbeat(parts[0], input.LeaseID)
-		if err != nil {
-			writeError(w, http.StatusConflict, "lease_inactive")
-			return
-		}
-		writeJSON(w, http.StatusOK, job)
-	case "complete":
-		var input struct {
-			LeaseID   string `json:"lease_id"`
-			Success   bool   `json:"success"`
-			ErrorCode string `json:"error_code,omitempty"`
-		}
-		if err := decodeJSON(r, &input); err != nil || input.LeaseID == "" {
-			writeError(w, http.StatusBadRequest, "invalid_request")
-			return
-		}
-		job, err := h.Service.WorkerFinish(parts[0], input.LeaseID, input.Success, input.ErrorCode)
-		if err != nil {
-			writeError(w, http.StatusConflict, "lease_inactive")
-			return
-		}
-		writeJSON(w, http.StatusOK, job)
-	default:
-		http.NotFound(w, r)
-	}
-}
-
 func decodeJSON(r *http.Request, out any) error {
 	if r == nil || r.Body == nil {
 		return errors.New("request body is required")
@@ -293,6 +191,8 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "profile_not_found")
 	case strings.Contains(message, "already active"), strings.Contains(message, "rate limited"), strings.Contains(message, "finalization"):
 		writeError(w, http.StatusConflict, "operation_conflict")
+	case strings.Contains(message, "runtime is unavailable"):
+		writeError(w, http.StatusServiceUnavailable, "login_runtime_unavailable")
 	default:
 		writeError(w, http.StatusBadRequest, "invalid_request")
 	}

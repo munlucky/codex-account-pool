@@ -13,10 +13,10 @@ import (
 
 const profileWriteLockStaleAfter = 15 * time.Minute
 
-// AcquireProfileWriteLock serializes auth.json writers across the router
-// process and the host login worker. The lock is profile-scoped so unrelated
-// accounts continue serving requests while one account is being refreshed or
-// re-authenticated.
+// AcquireProfileWriteLock serializes auth.json writers across token refresh
+// and the container-owned Codex login runtime. The lock is profile-scoped so
+// unrelated accounts continue serving requests while one account is refreshed
+// or re-authenticated.
 func AcquireProfileWriteLock(ctx context.Context, store *profile.Store, profileID string) (func(), error) {
 	if store == nil {
 		return nil, errors.New("profile store is required")

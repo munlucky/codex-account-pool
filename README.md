@@ -43,24 +43,9 @@ local clients                     |
 
 - Windows 10/11 or macOS 12+
 - Docker Desktop with Docker Compose v2
-- Official `codex` CLI available in `PATH`
 - One or more ChatGPT accounts that can sign in through Codex
 
-No local Go installation is required for the normal Docker setup.
-
-Install Codex on Windows if needed:
-
-```powershell
-irm https://chatgpt.com/codex/install.ps1 | iex
-```
-
-Install Codex on macOS if needed:
-
-```bash
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
-
-Homebrew is also supported upstream with `brew install --cask codex`. See the [upstream Codex repository](https://github.com/openai/codex) for current installation methods.
+No host Codex CLI or Go installation is required for the normal Docker setup. The Docker image contains a checksum-pinned official Codex Linux runtime used by the administrator device-code login flow and Codex compatibility operations.
 
 ### 1. Clone and run setup
 
@@ -80,45 +65,31 @@ cd gpt-codex-router
 ./setup.sh
 ```
 
-Both setup scripts assign `account-1`, `account-2`, and so on automatically. You only repeat the official ChatGPT/Codex sign-in for each account you want to add:
+Setup now starts the router first. Account login is performed afterward from the local administrator UI:
 
 ```text
-account-1 -> official `codex login` -> browser ChatGPT sign-in
-          -> sign in to another account? y
-account-2 -> official `codex login` -> browser ChatGPT sign-in
-          -> sign in to another account? n
-          -> Docker build + start + health check
+setup
+  -> preserve the existing state-root selected by .env
+  -> Docker build + start + health check
+  -> open http://127.0.0.1:8317/admin
+  -> enter the administrator key
+  -> choose a profile name such as account-1
+  -> Login
+  -> open the displayed ChatGPT verification URL
+  -> enter the displayed device code
+  -> router validates the new auth state and checks that exact profile
 ```
 
-When the final login is complete, setup automatically:
+The setup scripts:
 
-1. writes the local profile registry;
-2. creates or reuses the router-local `/v1` `client-key`;
-3. records the installed Codex client version for `/v1/models`;
-4. writes the host-state path to the ignored local `.env` used by Compose;
-5. builds and starts the Docker container;
-6. checks `http://127.0.0.1:8317/healthz`;
-7. backs up and configures `~/.codex/config.toml` (or `%USERPROFILE%\.codex\config.toml` on Windows);
-8. creates separate administrator/host-worker credentials and starts the host login worker;
-9. exposes the local account-management UI at `http://127.0.0.1:8317/admin`.
+1. create or reuse the router-local `/v1` `client-key`;
+2. preserve the existing custom/legacy state root when `.env` already selects one;
+3. build the Docker image, including the checksum-pinned Codex runtime used for device-code authentication;
+4. start the container and check `http://127.0.0.1:8317/healthz`;
+5. back up and configure `~/.codex/config.toml` (or `%USERPROFILE%\.codex\config.toml` on Windows);
+6. expose the local account-management UI at `http://127.0.0.1:8317/admin`.
 
-Then **fully restart Codex Desktop**. Future Codex account checks, additions, and re-logins can be started from the management UI without stopping the Docker service.
-
-For the **initial bootstrap only**, you can pass custom profile names while completing each browser login interactively:
-
-Windows:
-
-```powershell
-.\setup.ps1 -Profiles personal,work,backup
-```
-
-macOS:
-
-```bash
-./setup.sh --profiles personal,work,backup
-```
-
-The setup scripts intentionally retain the legacy bootstrap behavior of stopping the router before those interactive logins. After the first installation, do **not** rerun setup just to add or re-authenticate an account. Use `http://127.0.0.1:8317/admin` instead; the host worker performs that login without stopping the Docker service or changing the currently selected account.
+The setup process no longer performs interactive host-side `codex login` and does not install a background host worker. New accounts and re-authentication are owned by the running container. Existing installations that still contain `worker-key`, `host-worker.pid`, or `host-tools/` may leave those legacy files in place; current versions do not read them, and setup only stops a verifiably running obsolete worker during migration.
 
 If you downloaded a ZIP instead of cloning, extract it and run `setup.cmd` on Windows or `./setup.sh` on macOS from that folder. If the ZIP loses the executable bit on macOS, run `chmod +x setup.sh` once.
 
@@ -174,18 +145,15 @@ The state root also contains router-owned runtime files:
 ```text
 registry.json                              provider profiles + active profile per provider
 client-key                                 local bearer key for /v1/*
-codex-client-version                       Codex version used for model-catalog compatibility
 admin-key                                  browser administrator bootstrap key
-worker-key                                 host login worker key
 admin-state.json                           bounded profile check/login job state
-host-worker.pid                            host-side login worker process id
 observability/                             JSONL lifecycle events and daily summaries
 profiles/codex/<profile>/                  isolated Codex OAuth state
   .gcr-login-backup.json                   transient 0600 login crash-recovery copy while a result is unsettled
 profiles/google-antigravity/<profile>/     isolated Google Antigravity OAuth/project state
 ```
 
-The setup script writes only the selected host-state path to the ignored repository-local `.env` file so ordinary `docker compose ...` commands use the same mount later. The `.env` file does not contain ChatGPT tokens or the local client key. Existing installations may deliberately point `.env` at a legacy/custom state root; do not delete, migrate, or rerun setup into a different root casually because the profile OAuth state and `client-key` live there.
+The setup script ensures the ignored repository-local `.env` contains the selected host-state path so ordinary `docker compose ...` commands use the same mount later. Existing non-state-root entries, such as optional Antigravity settings, are preserved. ChatGPT profile tokens and the router `client-key` remain in the managed state root rather than `.env`. Existing installations may deliberately point `.env` at a legacy/custom state root; setup reuses that path instead of silently creating a second credential store.
 
 ### Codex Desktop config
 
@@ -336,11 +304,11 @@ docker compose exec gpt-codex-router gpt-codex-router auth use codex personal
 
 The selected profile applies to new backend requests. An already-running stream stays bound to the credentials with which it started.
 
-For normal post-install account maintenance, open `http://127.0.0.1:8317/admin`. Retrieve the administrator key with `docker compose exec -T gpt-codex-router gpt-codex-router admin-key`, then use **연결 확인**, **로그인**, or **다시 로그인** in the browser. The Docker image intentionally still does not include the interactive Codex CLI; the local host worker executes the official browser login without stopping the router.
+For account maintenance, open `http://127.0.0.1:8317/admin`. Retrieve the administrator key with `docker compose exec -T gpt-codex-router gpt-codex-router admin-key`, then use **연결 확인**, **로그인**, or **다시 로그인**. Login runs the official Codex app-server inside the container with that profile's isolated `CODEX_HOME`; the UI displays only the HTTPS verification URL and device code needed to approve the ChatGPT login.
 
 The profile list itself is side-effect free: it reads local token metadata and the last explicit check result. `connected` means an explicit check for that exact profile reached the Codex model catalog with HTTP 200; an expired access token with a stored refresh token remains `access_expired_unverified` until refresh/check is actually attempted.
 
-See [Docker account authentication management](docs/admin-account-management.md) for the API, state model, worker lease protocol, recovery rules, and live-verification checklist.
+See [Docker account authentication management](docs/admin-account-management.md) for the device-code flow, API/state model, rollback rules, and live-verification checklist.
 
 ### Remove / restore
 
@@ -392,10 +360,9 @@ GPT Codex Router handles bearer credentials for your ChatGPT/Codex sessions. It 
 - Docker listens on `0.0.0.0:8317` **inside the container only**; Compose publishes it as `127.0.0.1:8317` on the host.
 - `/backend-api` and `/backend-api/*` remain the Codex passthrough surface. Authenticated `/v1/*` routes are handled by the local OpenAI-compatible adapter and then enter the same credential/failover gateway.
 - `/admin/*` uses a separate administrator key/session from the `/v1` client key; mutating browser calls require same-origin and CSRF validation.
-- `/admin/worker/*` accepts only the separate host-worker key. Worker jobs contain no arbitrary command or path supplied by the browser.
+- Codex login is container-owned. The UI receives only a bounded device-login verification URL and user code; OAuth tokens, raw account IDs, and upstream response bodies are not returned.
 - Inbound auth/cookie headers are removed before the selected profile credentials are attached upstream.
-- OAuth refresh is constrained to the selected profile and rejects an account-identity change. Host login and refresh share a profile-scoped write lock, so unrelated profiles continue serving.
-- The host worker discards raw Codex CLI stdout/stderr and administrator responses/job files never contain OAuth tokens, raw account IDs, authorization codes, or upstream response bodies.
+- OAuth refresh and container-owned login share a profile-scoped write lock. An existing profile is restored if re-login fails or resolves to a different ChatGPT account, while unrelated profiles continue serving.
 - Real credentials are never needed by the automated test suite.
 
 Read [SECURITY.md](SECURITY.md) before changing listener exposure, credential storage, proxy headers, or OAuth behavior.

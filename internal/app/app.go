@@ -16,11 +16,11 @@ import (
 
 	"github.com/munlucky/codex-account-pool/internal/adminapi"
 	"github.com/munlucky/codex-account-pool/internal/adminauth"
-	"github.com/munlucky/codex-account-pool/internal/adminworker"
 	"github.com/munlucky/codex-account-pool/internal/antigravity"
 	"github.com/munlucky/codex-account-pool/internal/antigravityauth"
 	"github.com/munlucky/codex-account-pool/internal/authbroker"
 	"github.com/munlucky/codex-account-pool/internal/clientauth"
+	"github.com/munlucky/codex-account-pool/internal/codexlogin"
 	"github.com/munlucky/codex-account-pool/internal/codexmeta"
 	"github.com/munlucky/codex-account-pool/internal/gateway"
 	"github.com/munlucky/codex-account-pool/internal/observability"
@@ -79,8 +79,6 @@ func (a *App) Execute(ctx context.Context, args []string) error {
 		return a.executeAPIKey(args[1:])
 	case "admin-key":
 		return a.executeAdminKey(args[1:])
-	case "worker":
-		return a.executeWorker(ctx, args[1:])
 	case "report":
 		return a.executeReport(args[1:])
 	case "help", "--help", "-h":
@@ -152,14 +150,7 @@ func (a *App) authAdd(ctx context.Context, provider, id string) error {
 
 	switch provider {
 	case profile.ProviderCodex:
-		home := a.Store.CodexHome(id)
-		if err := os.MkdirAll(home, 0o700); err != nil {
-			return fmt.Errorf("create CODEX_HOME: %w", err)
-		}
-		fmt.Fprintf(a.Out, "Starting official Codex ChatGPT login for profile %q.\n", id)
-		if err := a.Executor.Run(ctx, codexCommand(a.CodexBin, home, []string{"login"})); err != nil {
-			return err
-		}
+		return errors.New("Codex account login is managed by http://127.0.0.1:8317/admin")
 	case profile.ProviderGoogleAntigravity:
 		home := a.Store.ProfileHome(provider, id)
 		if err := os.MkdirAll(home, 0o700); err != nil {
@@ -188,12 +179,7 @@ func (a *App) authLoginCodex(ctx context.Context, id string) error {
 	if _, ok := registry.Find(profile.ProviderCodex, id); !ok {
 		return fmt.Errorf("profile codex/%s not found", id)
 	}
-	home := a.Store.CodexHome(id)
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return fmt.Errorf("create CODEX_HOME: %w", err)
-	}
-	fmt.Fprintf(a.Out, "Refreshing official Codex ChatGPT login for profile %q.\n", id)
-	return a.Executor.Run(ctx, codexCommand(a.CodexBin, home, []string{"login"}))
+	return errors.New("Codex re-login is managed by http://127.0.0.1:8317/admin")
 }
 
 func (a *App) authLoginAntigravity(ctx context.Context, id string) error {
@@ -350,39 +336,6 @@ func (a *App) executeAdminKey(args []string) error {
 	return nil
 }
 
-func (a *App) executeWorker(ctx context.Context, args []string) error {
-	serverURL := "http://127.0.0.1:8317"
-	once := false
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--server":
-			if i+1 >= len(args) {
-				return fmt.Errorf("%w: --server requires a value", ErrUsage)
-			}
-			serverURL = args[i+1]
-			i++
-		case "--once":
-			once = true
-		default:
-			return fmt.Errorf("%w: usage: worker [--server http://127.0.0.1:8317] [--once]", ErrUsage)
-		}
-	}
-	workerKey, err := adminauth.EnsureWorkerKey(a.Store.Root())
-	if err != nil {
-		return err
-	}
-	worker := &adminworker.Worker{
-		ServerURL: serverURL,
-		WorkerKey: workerKey,
-		Store:     a.Store,
-		Executor:  a.Executor,
-		CodexBin:  a.CodexBin,
-		Out:       a.Out,
-		Err:       a.Err,
-	}
-	return worker.Run(ctx, once)
-}
-
 func (a *App) executeServe(ctx context.Context, args []string) error {
 	listen, err := parseServeArgs(args)
 	if err != nil {
@@ -438,10 +391,6 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("initialize administrator authentication: %w", err)
 	}
-	workerKey, err := adminauth.EnsureWorkerKey(a.Store.Root())
-	if err != nil {
-		return fmt.Errorf("initialize host worker authentication: %w", err)
-	}
 	adminState, err := adminapi.OpenStateStore(a.Store.Root())
 	if err != nil {
 		return fmt.Errorf("initialize administrator state: %w", err)
@@ -450,7 +399,11 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 		Broker: broker, Gateway: handler, ClientVersion: clientVersion,
 	}
 	adminService := adminapi.NewService(a.Store, broker, adminState, checker)
-	adminHandler := adminapi.NewHandler(adminService, adminauth.NewSessions(adminKey), workerKey)
+	adminService.LoginRunner = &codexlogin.AppServerRunner{CodexBin: a.CodexBin, ClientVersion: clientVersion}
+	if err := adminService.ReconcileLoginBackups(); err != nil {
+		return fmt.Errorf("reconcile administrator login recovery: %w", err)
+	}
+	adminHandler := adminapi.NewHandler(adminService, adminauth.NewSessions(adminKey))
 
 	logger.Emit(observability.Event{EventType: observability.EventStartup})
 	server := &http.Server{
@@ -560,6 +513,9 @@ func selectProfile(registry *profile.Registry, provider, requestedID string) (pr
 	if p, ok := registry.ActiveProfile(provider); ok {
 		return p, nil
 	}
+	if provider == profile.ProviderCodex {
+		return profile.Profile{}, errors.New("no active codex profile; add one at http://127.0.0.1:8317/admin")
+	}
 	return profile.Profile{}, fmt.Errorf("no active %s profile; add one with `auth add %s <profile>`", provider, provider)
 }
 
@@ -582,8 +538,7 @@ func (a *App) printUsage() {
 	fmt.Fprintln(a.Out, strings.TrimSpace(`GPT Codex Router - local ChatGPT auth gateway
 
 Usage:
-  gpt-codex-router auth add codex <profile>
-  gpt-codex-router auth login codex <profile>
+  Codex account login/re-login: http://127.0.0.1:8317/admin
   gpt-codex-router auth add google-antigravity <profile>
   gpt-codex-router auth login google-antigravity <profile>
   gpt-codex-router auth list
@@ -592,7 +547,6 @@ Usage:
   gpt-codex-router serve [--listen 127.0.0.1:8317]
   gpt-codex-router api-key
   gpt-codex-router admin-key
-  gpt-codex-router worker [--server http://127.0.0.1:8317] [--once]
   gpt-codex-router report [--since 3h] [--timezone Asia/Seoul] [--file <jsonl>|--stdin]
   gpt-codex-router run codex [--profile <id>] [-- <client args...>]
   gpt-codex-router version

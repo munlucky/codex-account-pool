@@ -5,6 +5,11 @@
 /.gpt-codex-router/
 /registry.json
 /client-key
+/admin-key
+/admin-state.json
+/worker-key
+/host-worker.pid
+/host-tools/
 /codex-client-version
 /profiles/
 

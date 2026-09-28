@@ -19,10 +19,9 @@ const (
 )
 
 type persistedState struct {
-	Version     int                    `json:"version"`
-	Jobs        map[string]Job         `json:"jobs"`
-	Checks      map[string]CheckRecord `json:"checks"`
-	Diagnostics Diagnostics            `json:"diagnostics"`
+	Version int                    `json:"version"`
+	Jobs    map[string]Job         `json:"jobs"`
+	Checks  map[string]CheckRecord `json:"checks"`
 }
 
 type StateStore struct {
@@ -67,11 +66,12 @@ func (s *StateStore) load() error {
 	}
 	changed := false
 	for id, job := range s.state.Jobs {
-		if job.State == JobChecking || job.State == JobLoggingIn || job.State == JobFinalizing {
+		if job.State == JobChecking || job.State == JobLoggingIn || job.State == JobFinalizing ||
+			(job.Type == JobTypeLogin && job.State == JobQueued) {
 			job.State = JobFailed
 			job.ErrorCode = ErrServiceRestarted
-			job.LeaseID = ""
-			job.LeaseUntil = time.Time{}
+			job.VerificationURL = ""
+			job.UserCode = ""
 			job.UpdatedAt = s.now().UTC()
 			s.state.Jobs[id] = job
 			changed = true
@@ -87,13 +87,37 @@ func (s *StateStore) CreateJob(kind, provider, profileID string, newProfile bool
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now().UTC()
-	state := JobQueued
+	state := JobLoggingIn
 	if kind == JobTypeCheck {
 		state = JobChecking
 	}
 	job := Job{
 		ID: randomID("j_"), Type: kind, Provider: provider, ProfileID: profileID,
 		NewProfile: newProfile, State: state, CreatedAt: now, UpdatedAt: now,
+	}
+	s.state.Jobs[job.ID] = job
+	return job, s.saveLocked()
+}
+
+func (s *StateStore) CreateLoginJob(provider, profileID string, newProfile bool) (Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, existing := range s.state.Jobs {
+		active := existing.State == JobQueued || existing.State == JobChecking || existing.State == JobLoggingIn || existing.State == JobFinalizing
+		if !active {
+			continue
+		}
+		if existing.Provider == provider && existing.ProfileID == profileID {
+			return Job{}, fmt.Errorf("profile operation already active: %s", existing.ID)
+		}
+		if existing.Type == JobTypeLogin {
+			return Job{}, fmt.Errorf("another login operation is already active: %s", existing.ID)
+		}
+	}
+	now := s.now().UTC()
+	job := Job{
+		ID: randomID("j_"), Type: JobTypeLogin, Provider: provider, ProfileID: profileID,
+		NewProfile: newProfile, State: JobLoggingIn, CreatedAt: now, UpdatedAt: now,
 	}
 	s.state.Jobs[job.ID] = job
 	return job, s.saveLocked()
@@ -114,7 +138,7 @@ func (s *StateStore) ActiveJob(provider, profileID string) (Job, bool) {
 		if job.Provider != provider || job.ProfileID != profileID {
 			continue
 		}
-		if job.State != JobChecking && job.State != JobQueued && job.State != JobLoggingIn && job.State != JobFinalizing {
+		if job.State != JobChecking && job.State != JobLoggingIn && job.State != JobFinalizing && job.State != JobQueued {
 			continue
 		}
 		if found.ID == "" || job.CreatedAt.After(found.CreatedAt) {
@@ -122,6 +146,23 @@ func (s *StateStore) ActiveJob(provider, profileID string) (Job, bool) {
 		}
 	}
 	return found, found.ID != ""
+}
+
+func (s *StateStore) ActiveJobs() []PublicJob {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	jobs := make([]Job, 0)
+	for _, job := range s.state.Jobs {
+		if job.State == JobChecking || job.State == JobLoggingIn || job.State == JobFinalizing || job.State == JobQueued {
+			jobs = append(jobs, job)
+		}
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.Before(jobs[j].CreatedAt) })
+	result := make([]PublicJob, 0, len(jobs))
+	for _, job := range jobs {
+		result = append(result, job.Public())
+	}
+	return result
 }
 
 func (s *StateStore) RecentJob(kind, provider, profileID string) (Job, bool) {
@@ -176,6 +217,65 @@ func (s *StateStore) Check(provider, profileID string) (CheckRecord, bool) {
 	return record, ok
 }
 
+func (s *StateStore) SetLoginChallenge(id, verificationURL, userCode string) (Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.state.Jobs[id]
+	if !ok {
+		return Job{}, errors.New("job not found")
+	}
+	if job.Type != JobTypeLogin || job.State != JobLoggingIn {
+		return job, errors.New("login job is not active")
+	}
+	job.VerificationURL = verificationURL
+	job.UserCode = userCode
+	job.UpdatedAt = s.now().UTC()
+	s.state.Jobs[id] = job
+	return job, s.saveLocked()
+}
+
+func (s *StateStore) BeginLoginFinalization(id string) (Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.state.Jobs[id]
+	if !ok {
+		return Job{}, errors.New("job not found")
+	}
+	if job.Type != JobTypeLogin || job.State != JobLoggingIn {
+		return job, errors.New("login job is not active")
+	}
+	job.State = JobFinalizing
+	job.VerificationURL = ""
+	job.UserCode = ""
+	job.UpdatedAt = s.now().UTC()
+	s.state.Jobs[id] = job
+	return job, s.saveLocked()
+}
+
+func (s *StateStore) FinishLogin(id string, success bool, errorCode string) (Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.state.Jobs[id]
+	if !ok {
+		return Job{}, errors.New("job not found")
+	}
+	if job.Type != JobTypeLogin || job.State != JobFinalizing {
+		return job, errors.New("login finalization is not active")
+	}
+	job.UpdatedAt = s.now().UTC()
+	job.VerificationURL = ""
+	job.UserCode = ""
+	if success {
+		job.State = JobSucceeded
+		job.ErrorCode = ""
+	} else {
+		job.State = JobFailed
+		job.ErrorCode = errorCode
+	}
+	s.state.Jobs[id] = job
+	return job, s.saveLocked()
+}
+
 func (s *StateStore) CancelJob(id string) (Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -191,9 +291,9 @@ func (s *StateStore) CancelJob(id string) (Job, error) {
 	}
 	job.State = JobCanceled
 	job.ErrorCode = ErrCanceled
+	job.VerificationURL = ""
+	job.UserCode = ""
 	job.UpdatedAt = s.now().UTC()
-	job.LeaseID = ""
-	job.LeaseUntil = time.Time{}
 	s.state.Jobs[id] = job
 	return job, s.saveLocked()
 }
@@ -210,150 +310,11 @@ func (s *StateStore) FailJob(id, errorCode string) error {
 	}
 	job.State = JobFailed
 	job.ErrorCode = errorCode
+	job.VerificationURL = ""
+	job.UserCode = ""
 	job.UpdatedAt = s.now().UTC()
-	job.LeaseID = ""
-	job.LeaseUntil = time.Time{}
 	s.state.Jobs[id] = job
 	return s.saveLocked()
-}
-
-func (s *StateStore) LeaseLogin(leaseFor time.Duration) (Job, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.now().UTC()
-	var candidates []Job
-	changed := false
-	for id, job := range s.state.Jobs {
-		if job.Type != JobTypeLogin {
-			continue
-		}
-		if job.State == JobLoggingIn && !job.LeaseUntil.After(now) {
-			job.State = JobFailed
-			job.ErrorCode = ErrWorkerRestarted
-			job.LeaseID = ""
-			job.LeaseUntil = time.Time{}
-			job.UpdatedAt = now
-			s.state.Jobs[id] = job
-			changed = true
-			continue
-		}
-		if job.State == JobQueued {
-			candidates = append(candidates, job)
-		}
-	}
-	if len(candidates) == 0 {
-		if changed {
-			if err := s.saveLocked(); err != nil {
-				return Job{}, false, err
-			}
-		}
-		return Job{}, false, nil
-	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].CreatedAt.Before(candidates[j].CreatedAt) })
-	job := candidates[0]
-	job.State = JobLoggingIn
-	job.ErrorCode = ""
-	job.LeaseID = randomID("l_")
-	job.LeaseUntil = now.Add(leaseFor)
-	job.UpdatedAt = now
-	s.state.Jobs[job.ID] = job
-	return job, true, s.saveLocked()
-}
-
-func (s *StateStore) Heartbeat(id, leaseID string, leaseFor time.Duration) (Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	job, ok := s.state.Jobs[id]
-	if !ok {
-		return Job{}, errors.New("job not found")
-	}
-	if job.State != JobLoggingIn || job.LeaseID == "" || job.LeaseID != leaseID {
-		return job, errors.New("job lease is not active")
-	}
-	now := s.now().UTC()
-	if !job.LeaseUntil.After(now) {
-		job.State = JobFailed
-		job.ErrorCode = ErrWorkerRestarted
-		job.LeaseID = ""
-		job.LeaseUntil = time.Time{}
-		job.UpdatedAt = now
-		s.state.Jobs[id] = job
-		if err := s.saveLocked(); err != nil {
-			return job, err
-		}
-		return job, errors.New("job lease expired")
-	}
-	job.LeaseUntil = now.Add(leaseFor)
-	job.UpdatedAt = now
-	s.state.Jobs[id] = job
-	return job, s.saveLocked()
-}
-
-func (s *StateStore) BeginLoginCompletion(id, leaseID string) (Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	job, ok := s.state.Jobs[id]
-	if !ok {
-		return Job{}, errors.New("job not found")
-	}
-	if job.State != JobLoggingIn || job.LeaseID == "" || job.LeaseID != leaseID {
-		return job, errors.New("job lease is not active")
-	}
-	now := s.now().UTC()
-	if !job.LeaseUntil.After(now) {
-		job.State = JobFailed
-		job.ErrorCode = ErrWorkerRestarted
-		job.LeaseID = ""
-		job.LeaseUntil = time.Time{}
-		job.UpdatedAt = now
-		s.state.Jobs[id] = job
-		if err := s.saveLocked(); err != nil {
-			return job, err
-		}
-		return job, errors.New("job lease expired")
-	}
-	job.State = JobFinalizing
-	job.LeaseUntil = time.Time{}
-	job.UpdatedAt = now
-	s.state.Jobs[id] = job
-	return job, s.saveLocked()
-}
-
-func (s *StateStore) FinishLogin(id, leaseID string, success bool, errorCode string) (Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	job, ok := s.state.Jobs[id]
-	if !ok {
-		return Job{}, errors.New("job not found")
-	}
-	if job.State != JobFinalizing || job.LeaseID == "" || job.LeaseID != leaseID {
-		return job, errors.New("job finalization is not active")
-	}
-	job.LeaseID = ""
-	job.LeaseUntil = time.Time{}
-	job.UpdatedAt = s.now().UTC()
-	if success {
-		job.State = JobSucceeded
-		job.ErrorCode = ""
-	} else {
-		job.State = JobFailed
-		job.ErrorCode = errorCode
-	}
-	s.state.Jobs[id] = job
-	return job, s.saveLocked()
-}
-
-func (s *StateStore) SetDiagnostics(d Diagnostics) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.state.Diagnostics = d
-	return s.saveLocked()
-}
-
-func (s *StateStore) Diagnostics() Diagnostics {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.state.Diagnostics
 }
 
 func (s *StateStore) pruneJobsLocked() {

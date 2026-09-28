@@ -17,6 +17,9 @@ const (
 	JobTypeCheck = "check"
 	JobTypeLogin = "login"
 
+	// JobQueued is retained only so state written by the previous host-worker
+	// implementation can be migrated safely on startup. New login jobs start
+	// directly in JobLoggingIn because the router owns the login runtime.
 	JobQueued     = "queued"
 	JobChecking   = "checking"
 	JobLoggingIn  = "logging_in"
@@ -27,18 +30,17 @@ const (
 )
 
 const (
-	ErrNotLoggedIn       = "not_logged_in"
-	ErrReauthRequired    = "reauth_required"
-	ErrTemporary         = "temporarily_unavailable"
-	ErrCanceled          = "canceled"
-	ErrTimeout           = "timeout"
-	ErrWorkerUnavailable = "worker_unavailable"
-	ErrWorkerRestarted   = "worker_restarted"
-	ErrServiceRestarted  = "service_restarted"
-	ErrLoginFailed       = "login_failed"
-	ErrAccountMismatch   = "account_mismatch"
-	ErrAuthFileInvalid   = "auth_file_invalid"
-	ErrWriteFailed       = "auth_write_failed"
+	ErrNotLoggedIn           = "not_logged_in"
+	ErrReauthRequired        = "reauth_required"
+	ErrTemporary             = "temporarily_unavailable"
+	ErrCanceled              = "canceled"
+	ErrTimeout               = "timeout"
+	ErrServiceRestarted      = "service_restarted"
+	ErrLoginFailed           = "login_failed"
+	ErrDeviceAuthUnavailable = "device_auth_unavailable"
+	ErrAccountMismatch       = "account_mismatch"
+	ErrAuthFileInvalid       = "auth_file_invalid"
+	ErrWriteFailed           = "auth_write_failed"
 )
 
 type ProfileView struct {
@@ -59,37 +61,32 @@ type CheckRecord struct {
 	CheckedAt time.Time `json:"checked_at"`
 }
 
-type Diagnostics struct {
-	WorkerSeenAt        *time.Time `json:"worker_seen_at,omitempty"`
-	DesktopRoutingState string     `json:"desktop_routing_state"`
-	DesktopCheckedAt    *time.Time `json:"desktop_checked_at,omitempty"`
-}
-
 type Job struct {
-	ID         string    `json:"id"`
-	Type       string    `json:"type"`
-	Provider   string    `json:"provider"`
-	ProfileID  string    `json:"profile_id"`
-	NewProfile bool      `json:"new_profile,omitempty"`
-	State      string    `json:"state"`
-	ErrorCode  string    `json:"error_code,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
-
-	LeaseID    string    `json:"lease_id,omitempty"`
-	LeaseUntil time.Time `json:"lease_until,omitempty"`
+	ID              string    `json:"id"`
+	Type            string    `json:"type"`
+	Provider        string    `json:"provider"`
+	ProfileID       string    `json:"profile_id"`
+	NewProfile      bool      `json:"new_profile,omitempty"`
+	State           string    `json:"state"`
+	ErrorCode       string    `json:"error_code,omitempty"`
+	VerificationURL string    `json:"verification_url,omitempty"`
+	UserCode        string    `json:"user_code,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type PublicJob struct {
-	ID         string    `json:"id"`
-	Type       string    `json:"type"`
-	Provider   string    `json:"provider"`
-	ProfileID  string    `json:"profile_id"`
-	NewProfile bool      `json:"new_profile,omitempty"`
-	State      string    `json:"state"`
-	ErrorCode  string    `json:"error_code,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID              string    `json:"id"`
+	Type            string    `json:"type"`
+	Provider        string    `json:"provider"`
+	ProfileID       string    `json:"profile_id"`
+	NewProfile      bool      `json:"new_profile,omitempty"`
+	State           string    `json:"state"`
+	ErrorCode       string    `json:"error_code,omitempty"`
+	VerificationURL string    `json:"verification_url,omitempty"`
+	UserCode        string    `json:"user_code,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 func (j Job) Public() PublicJob {
@@ -100,11 +97,12 @@ func (j Job) Public() PublicJob {
 	return PublicJob{
 		ID: j.ID, Type: j.Type, Provider: j.Provider, ProfileID: j.ProfileID,
 		NewProfile: j.NewProfile, State: state, ErrorCode: j.ErrorCode,
+		VerificationURL: j.VerificationURL, UserCode: j.UserCode,
 		CreatedAt: j.CreatedAt, UpdatedAt: j.UpdatedAt,
 	}
 }
 
 type ProfileListResponse struct {
-	Profiles    []ProfileView `json:"profiles"`
-	Diagnostics Diagnostics   `json:"diagnostics"`
+	Profiles   []ProfileView `json:"profiles"`
+	ActiveJobs []PublicJob   `json:"active_jobs,omitempty"`
 }

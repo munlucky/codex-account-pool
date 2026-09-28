@@ -5,21 +5,18 @@ import (
 	"testing"
 )
 
-func TestAdminAndWorkerKeysAreDistinct(t *testing.T) {
+func TestAdminKeyIsStableAndMatches(t *testing.T) {
 	root := t.TempDir()
-	adminKey, err := EnsureAdminKey(root)
+	first, err := EnsureAdminKey(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	workerKey, err := EnsureWorkerKey(root)
+	second, err := EnsureAdminKey(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if adminKey == workerKey || !MatchesKey(adminKey, adminKey) || MatchesKey(adminKey, workerKey) {
-		t.Fatalf("key separation failed")
-	}
-	if !MatchesBearer("Bearer "+workerKey, workerKey) || MatchesBearer("Bearer "+adminKey, workerKey) {
-		t.Fatalf("bearer separation failed")
+	if first != second || !MatchesKey(first, second) {
+		t.Fatalf("admin key was not stable")
 	}
 }
 

@@ -48,8 +48,7 @@ code { font-size: 12px; }
   <section id="app" class="hidden">
     <div class="card">
       <div class="row">
-        <strong>호스트 Worker</strong><span id="workerState" class="muted">확인 중</span>
-        <strong>Codex Desktop 라우팅</strong><span id="desktopState" class="muted">확인 중</span>
+        <strong>로그인 런타임</strong><span class="ok">Docker 내부 Codex device-code 인증</span>
         <button id="refreshButton" type="button">새로고침</button>
         <button id="logoutButton" type="button">로그아웃</button>
       </div>
@@ -67,6 +66,15 @@ code { font-size: 12px; }
           <tbody id="profiles"></tbody>
         </table>
       </div>
+      <div id="deviceLoginCard" class="card hidden">
+        <strong>ChatGPT 로그인 승인</strong>
+        <p class="muted">아래 주소를 브라우저에서 열고 코드를 입력하세요.</p>
+        <div class="row">
+          <a id="deviceLoginURL" target="_blank" rel="noopener noreferrer"></a>
+          <code id="deviceLoginCode"></code>
+          <button id="cancelLoginButton" type="button">로그인 취소</button>
+        </div>
+      </div>
       <div id="message"></div>
     </div>
   </section>
@@ -74,7 +82,8 @@ code { font-size: 12px; }
 <script>
 (function () {
   var csrf = "";
-  var pollTimer = 0;
+  var pollTimers = {};
+  var activeLoginJobID = "";
   var statusNames = {
     not_logged_in: "로그인 필요",
     unverified: "아직 연결 미확인",
@@ -145,7 +154,8 @@ code { font-size: 12px; }
         headers: {"Content-Type": "application/json"},
         body: "{}"
       });
-      setMessage((action === "login" ? "공식 Codex 브라우저 로그인을 시작했습니다. " : "연결 확인을 시작했습니다. ") + "작업 " + job.id, "");
+      if (action === "login") activeLoginJobID = job.id;
+      setMessage((action === "login" ? "Docker 내부 Codex 로그인 준비 중입니다. " : "연결 확인을 시작했습니다. ") + "작업 " + job.id, "");
       watchJob(job.id);
       await loadProfiles();
     } catch (error) {
@@ -153,18 +163,39 @@ code { font-size: 12px; }
     }
   }
 
+  function showLoginChallenge(job) {
+    if (!job || !job.verification_url || !job.user_code) return;
+    activeLoginJobID = job.id;
+    var card = document.getElementById("deviceLoginCard");
+    var link = document.getElementById("deviceLoginURL");
+    link.href = job.verification_url;
+    link.textContent = job.verification_url;
+    document.getElementById("deviceLoginCode").textContent = job.user_code;
+    card.classList.remove("hidden");
+  }
+
   async function watchJob(id) {
-    window.clearTimeout(pollTimer);
+    if (pollTimers[id]) window.clearTimeout(pollTimers[id]);
     try {
       var job = await request("/admin/jobs/" + encodeURIComponent(id));
+      if (job.state === "logging_in" && job.verification_url && job.user_code) {
+        showLoginChallenge(job);
+        setMessage("ChatGPT에서 코드를 승인하면 자동으로 연결 확인까지 진행됩니다.", "");
+      }
       if (job.state === "queued" || job.state === "checking" || job.state === "logging_in") {
-        pollTimer = window.setTimeout(function () { watchJob(id); }, 1000);
+        pollTimers[id] = window.setTimeout(function () { watchJob(id); }, 1000);
       } else {
+        delete pollTimers[id];
+        if (activeLoginJobID === id) {
+          activeLoginJobID = "";
+          document.getElementById("deviceLoginCard").classList.add("hidden");
+        }
         var suffix = job.error_code ? " (" + job.error_code + ")" : "";
         setMessage("작업 " + id + ": " + job.state + suffix, job.state === "succeeded" ? "ok" : "warn");
         await loadProfiles();
       }
     } catch (error) {
+      delete pollTimers[id];
       setMessage("작업 상태 조회 실패: " + error.code, "error");
     }
   }
@@ -232,25 +263,22 @@ code { font-size: 12px; }
       body.appendChild(tr);
     });
 
-    var diagnostics = data.diagnostics || {};
-    var worker = document.getElementById("workerState");
-    worker.textContent = diagnostics.worker_seen_at ? "최근 확인 " + dateText(diagnostics.worker_seen_at) : "실행 확인 안 됨";
-    var desktop = document.getElementById("desktopState");
-    if (diagnostics.desktop_routing_state === "configured") {
-      desktop.textContent = "켜짐";
-      desktop.className = "ok";
-    } else if (diagnostics.desktop_routing_state === "disabled") {
-      desktop.textContent = "꺼짐";
-      desktop.className = "warn";
-    } else {
-      desktop.textContent = "미확인";
-      desktop.className = "muted";
-    }
   }
 
   async function loadProfiles() {
     var data = await request("/admin/profiles");
     renderProfiles(data);
+    if (!activeLoginJobID) {
+      var jobs = data.active_jobs || [];
+      for (var i = 0; i < jobs.length; i++) {
+        if (jobs[i].type === "login" && jobs[i].state === "logging_in") {
+          activeLoginJobID = jobs[i].id;
+          showLoginChallenge(jobs[i]);
+          watchJob(jobs[i].id);
+          break;
+        }
+      }
+    }
   }
 
   async function restoreSession() {
@@ -294,6 +322,21 @@ code { font-size: 12px; }
     var profile = {provider: "codex", id: id};
     await startAction(profile, "login");
     input.value = "";
+  });
+
+  document.getElementById("cancelLoginButton").addEventListener("click", async function () {
+    if (!activeLoginJobID) return;
+    try {
+      await request("/admin/jobs/" + encodeURIComponent(activeLoginJobID) + "/cancel", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: "{}"
+      });
+      setMessage("로그인 취소를 요청했습니다.", "warn");
+      document.getElementById("deviceLoginCard").classList.add("hidden");
+    } catch (error) {
+      setMessage("로그인 취소 실패: " + error.code, "error");
+    }
   });
 
   document.getElementById("logoutButton").addEventListener("click", async function () {
