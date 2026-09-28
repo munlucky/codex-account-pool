@@ -18,6 +18,8 @@ type Command struct {
 	Dir        string
 	SetEnv     map[string]string
 	UnsetEnv   []string
+	Stdout     io.Writer
+	Stderr     io.Writer
 	Detached   bool
 }
 
@@ -56,6 +58,12 @@ func (e OSExecutor) Run(ctx context.Context, spec Command) error {
 		cmd.Stdin = e.Stdin
 		cmd.Stdout = e.Stdout
 		cmd.Stderr = e.Stderr
+		if spec.Stdout != nil {
+			cmd.Stdout = spec.Stdout
+		}
+		if spec.Stderr != nil {
+			cmd.Stderr = spec.Stderr
+		}
 	}
 	if spec.Detached {
 		if err := cmd.Start(); err != nil {

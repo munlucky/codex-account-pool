@@ -24,11 +24,16 @@ RUN resolved_commit="${COMMIT}"; \
       esac; \
     fi; \
     if [ -z "${resolved_commit}" ]; then resolved_commit="unknown"; fi; \
+    ldflags="-s -w -X main.version=${VERSION} -X main.commit=${resolved_commit}"; \
     CGO_ENABLED=0 go build \
       -trimpath \
-      -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${resolved_commit}" \
+      -ldflags="${ldflags}" \
       -o /out/gpt-codex-router \
-      ./cmd/gpt-codex-router
+      ./cmd/gpt-codex-router; \
+    mkdir -p /out/host-workers; \
+    CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="${ldflags}" -o /out/host-workers/gpt-codex-router-darwin-arm64 ./cmd/gpt-codex-router; \
+    CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags="${ldflags}" -o /out/host-workers/gpt-codex-router-darwin-amd64 ./cmd/gpt-codex-router; \
+    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="${ldflags}" -o /out/host-workers/gpt-codex-router-windows-amd64.exe ./cmd/gpt-codex-router
 
 FROM alpine:3.22
 
@@ -44,6 +49,7 @@ RUN apk add --no-cache ca-certificates \
     && chown 10001:10001 /data
 
 COPY --from=build /out/gpt-codex-router /usr/local/bin/gpt-codex-router
+COPY --from=build /out/host-workers /opt/gpt-codex-router/host-workers
 
 ENV GPT_CODEX_ROUTER_HOME=/data \
     GPT_CODEX_ROUTER_CONTAINER=1

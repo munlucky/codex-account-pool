@@ -98,31 +98,29 @@ When the final login is complete, setup automatically:
 4. writes the host-state path to the ignored local `.env` used by Compose;
 5. builds and starts the Docker container;
 6. checks `http://127.0.0.1:8317/healthz`;
-7. backs up and configures `~/.codex/config.toml` (or `%USERPROFILE%\.codex\config.toml` on Windows).
+7. backs up and configures `~/.codex/config.toml` (or `%USERPROFILE%\.codex\config.toml` on Windows);
+8. creates separate administrator/host-worker credentials and starts the host login worker;
+9. exposes the local account-management UI at `http://127.0.0.1:8317/admin`.
 
-Then **fully restart Codex Desktop**.
+Then **fully restart Codex Desktop**. Future Codex account checks, additions, and re-logins can be started from the management UI without stopping the Docker service.
 
-For custom names, or to re-authenticate an existing profile, pass profile names explicitly while still completing each browser login interactively.
+For the **initial bootstrap only**, you can pass custom profile names while completing each browser login interactively:
 
 Windows:
 
 ```powershell
 .\setup.ps1 -Profiles personal,work,backup
-# Later, re-authenticate only one existing profile:
-.\setup.ps1 -Profiles personal
 ```
 
 macOS:
 
 ```bash
 ./setup.sh --profiles personal,work,backup
-# Later, re-authenticate only one existing profile:
-./setup.sh --profiles personal
 ```
 
-If you downloaded a ZIP instead of cloning, extract it and run `setup.cmd` on Windows or `./setup.sh` on macOS from that folder. If the ZIP loses the executable bit on macOS, run `chmod +x setup.sh` once.
+The setup scripts intentionally retain the legacy bootstrap behavior of stopping the router before those interactive logins. After the first installation, do **not** rerun setup just to add or re-authenticate an account. Use `http://127.0.0.1:8317/admin` instead; the host worker performs that login without stopping the Docker service or changing the currently selected account.
 
-Rerun the platform setup script later to add more automatically named accounts. Existing profiles and the originally selected active profile are preserved.
+If you downloaded a ZIP instead of cloning, extract it and run `setup.cmd` on Windows or `./setup.sh` on macOS from that folder. If the ZIP loses the executable bit on macOS, run `chmod +x setup.sh` once.
 
 ### 2. Verify
 
@@ -177,8 +175,13 @@ The state root also contains router-owned runtime files:
 registry.json                              provider profiles + active profile per provider
 client-key                                 local bearer key for /v1/*
 codex-client-version                       Codex version used for model-catalog compatibility
+admin-key                                  browser administrator bootstrap key
+worker-key                                 host login worker key
+admin-state.json                           bounded profile check/login job state
+host-worker.pid                            host-side login worker process id
 observability/                             JSONL lifecycle events and daily summaries
 profiles/codex/<profile>/                  isolated Codex OAuth state
+  .gcr-login-backup.json                   transient 0600 login crash-recovery copy while a result is unsettled
 profiles/google-antigravity/<profile>/     isolated Google Antigravity OAuth/project state
 ```
 
@@ -333,7 +336,11 @@ docker compose exec gpt-codex-router gpt-codex-router auth use codex personal
 
 The selected profile applies to new backend requests. An already-running stream stays bound to the credentials with which it started.
 
-To add or refresh ChatGPT logins, rerun the host setup script. The Docker image intentionally does not include the interactive Codex CLI.
+For normal post-install account maintenance, open `http://127.0.0.1:8317/admin`. Retrieve the administrator key with `docker compose exec -T gpt-codex-router gpt-codex-router admin-key`, then use **연결 확인**, **로그인**, or **다시 로그인** in the browser. The Docker image intentionally still does not include the interactive Codex CLI; the local host worker executes the official browser login without stopping the router.
+
+The profile list itself is side-effect free: it reads local token metadata and the last explicit check result. `connected` means an explicit check for that exact profile reached the Codex model catalog with HTTP 200; an expired access token with a stored refresh token remains `access_expired_unverified` until refresh/check is actually attempted.
+
+See [Docker account authentication management](docs/admin-account-management.md) for the API, state model, worker lease protocol, recovery rules, and live-verification checklist.
 
 ### Remove / restore
 
@@ -384,8 +391,11 @@ GPT Codex Router handles bearer credentials for your ChatGPT/Codex sessions. It 
 - Native listeners must be loopback addresses. Loopback limits network exposure but does not authenticate other processes running as the local user, so the router is intended for a trusted single-user machine.
 - Docker listens on `0.0.0.0:8317` **inside the container only**; Compose publishes it as `127.0.0.1:8317` on the host.
 - `/backend-api` and `/backend-api/*` remain the Codex passthrough surface. Authenticated `/v1/*` routes are handled by the local OpenAI-compatible adapter and then enter the same credential/failover gateway.
+- `/admin/*` uses a separate administrator key/session from the `/v1` client key; mutating browser calls require same-origin and CSRF validation.
+- `/admin/worker/*` accepts only the separate host-worker key. Worker jobs contain no arbitrary command or path supplied by the browser.
 - Inbound auth/cookie headers are removed before the selected profile credentials are attached upstream.
-- OAuth refresh is constrained to the selected profile and rejects an account-identity change.
+- OAuth refresh is constrained to the selected profile and rejects an account-identity change. Host login and refresh share a profile-scoped write lock, so unrelated profiles continue serving.
+- The host worker discards raw Codex CLI stdout/stderr and administrator responses/job files never contain OAuth tokens, raw account IDs, authorization codes, or upstream response bodies.
 - Real credentials are never needed by the automated test suite.
 
 Read [SECURITY.md](SECURITY.md) before changing listener exposure, credential storage, proxy headers, or OAuth behavior.

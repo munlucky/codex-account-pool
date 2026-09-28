@@ -255,6 +255,54 @@ func TestAPIKeyCommandCreatesStableLocalKey(t *testing.T) {
 	}
 }
 
+func TestAdminKeyIsStableAndSeparateFromClientKey(t *testing.T) {
+	a, _, out := newTestApp(t)
+	if err := a.Execute(context.Background(), []string{"api-key"}); err != nil {
+		t.Fatal(err)
+	}
+	clientKey := strings.TrimSpace(out.String())
+
+	out.Reset()
+	if err := a.Execute(context.Background(), []string{"admin-key"}); err != nil {
+		t.Fatal(err)
+	}
+	adminKey := strings.TrimSpace(out.String())
+	if !strings.HasPrefix(adminKey, "gcr_admin_") || adminKey == clientKey {
+		t.Fatalf("admin=%q client=%q", adminKey, clientKey)
+	}
+	out.Reset()
+	if err := a.Execute(context.Background(), []string{"admin-key"}); err != nil {
+		t.Fatal(err)
+	}
+	if second := strings.TrimSpace(out.String()); second != adminKey {
+		t.Fatalf("admin key changed: first=%q second=%q", adminKey, second)
+	}
+}
+
+func TestServerHandlerRoutesAdminSeparately(t *testing.T) {
+	backendCalls, openAICalls, adminCalls := 0, 0, 0
+	handler := serverHandler(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			backendCalls++
+			w.WriteHeader(http.StatusTeapot)
+		}),
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			openAICalls++
+			w.WriteHeader(http.StatusCreated)
+		}),
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			adminCalls++
+			w.WriteHeader(http.StatusAccepted)
+		}),
+	)
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/admin/profiles", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted || adminCalls != 1 || backendCalls != 0 || openAICalls != 0 {
+		t.Fatalf("status=%d admin=%d backend=%d openai=%d", rec.Code, adminCalls, backendCalls, openAICalls)
+	}
+}
+
 func TestServeArgsDefaultTo8317(t *testing.T) {
 	got, err := parseServeArgs(nil)
 	if err != nil || got != "127.0.0.1:8317" {

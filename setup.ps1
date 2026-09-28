@@ -19,6 +19,7 @@ $profilePattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 $composeEnvPath = Join-Path $repoRoot '.env'
 $clientKeyPath = Join-Path $stateRoot 'client-key'
 $codexClientVersionPath = Join-Path $stateRoot 'codex-client-version'
+$workerPidPath = Join-Path $stateRoot 'host-worker.pid'
 
 function Require-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
@@ -256,6 +257,89 @@ function Start-Router {
     }
 }
 
+
+function Get-HostRouterBinary {
+    return (Join-Path $stateRoot 'host-tools\gpt-codex-router-windows-amd64.exe')
+}
+
+function Stop-HostWorker {
+    if (-not (Test-Path -LiteralPath $workerPidPath)) {
+        return
+    }
+    $rawPid = [System.IO.File]::ReadAllText($workerPidPath).Trim()
+    $pidValue = 0
+    if ([int]::TryParse($rawPid, [ref]$pidValue) -and $pidValue -gt 0) {
+        $process = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+        if ($process) {
+            try {
+                if ($process.Path -eq (Get-HostRouterBinary)) {
+                    Stop-Process -Id $pidValue -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                # Do not terminate a recycled PID when the executable cannot be verified.
+            }
+        }
+    }
+    Remove-Item -LiteralPath $workerPidPath -Force -ErrorAction SilentlyContinue
+}
+
+function Install-HostWorkerBinary {
+    $binary = Get-HostRouterBinary
+    $binaryDir = Split-Path -Parent $binary
+    New-Item -ItemType Directory -Force -Path $binaryDir | Out-Null
+    Stop-HostWorker
+    Remove-Item -LiteralPath $binary -Force -ErrorAction SilentlyContinue
+
+    Push-Location $repoRoot
+    try {
+        & docker compose cp 'gpt-codex-router:/opt/gpt-codex-router/host-workers/gpt-codex-router-windows-amd64.exe' $binary
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not extract the Windows host worker from the built Docker image (exit code $LASTEXITCODE)."
+        }
+    }
+    finally {
+        Pop-Location
+    }
+
+    if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+        throw "Host worker binary was not extracted to $binary."
+    }
+}
+
+function Start-HostWorker {
+    $binary = Get-HostRouterBinary
+    if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+        throw "Host worker binary is missing: $binary."
+    }
+
+    $previousHome = [Environment]::GetEnvironmentVariable('GPT_CODEX_ROUTER_HOME', 'Process')
+    try {
+        $env:GPT_CODEX_ROUTER_HOME = $stateRoot
+        $process = Start-Process -FilePath $binary -ArgumentList @(
+            'worker',
+            '--server',
+            'http://127.0.0.1:8317'
+        ) -WindowStyle Hidden -PassThru
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('GPT_CODEX_ROUTER_HOME', $previousHome, 'Process')
+    }
+
+    [System.IO.File]::WriteAllText($workerPidPath, [string]$process.Id + [Environment]::NewLine)
+    Start-Sleep -Milliseconds 500
+    $process.Refresh()
+    if ($process.HasExited) {
+        Remove-Item -LiteralPath $workerPidPath -Force -ErrorAction SilentlyContinue
+        throw 'Host login worker exited during startup.'
+    }
+}
+
+function Write-AdminAccessInfo {
+    Write-Host 'Account management UI: http://127.0.0.1:8317/admin' -ForegroundColor Green
+    Write-Host 'Administrator key command: docker compose exec -T gpt-codex-router gpt-codex-router admin-key' -ForegroundColor DarkGray
+}
+
 Require-Command 'codex'
 Require-Command 'docker'
 & docker compose version | Out-Null
@@ -270,6 +354,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-CodexClientVersion
 $clientApiKey = Ensure-ClientApiKey
 Write-ComposeEnvironment
+Stop-HostWorker
 Stop-ExistingRouter
 
 $registryState = Read-ExistingRegistry
@@ -327,8 +412,11 @@ if (-not $NoStart) {
     if (-not $SkipCodexConfig) {
         Set-CodexDesktopConfig
     }
+    Install-HostWorkerBinary
+    Start-HostWorker
     Write-Host ''
     Write-Host 'GPT Codex Router is running at http://127.0.0.1:8317' -ForegroundColor Green
+    Write-AdminAccessInfo
     Write-Host 'OpenAI-compatible base URL: http://127.0.0.1:8317/v1' -ForegroundColor Green
     Write-Host "Local API key file: $clientKeyPath" -ForegroundColor DarkGray
     if (-not $SkipCodexConfig) {

@@ -8,6 +8,7 @@ codex_config_path="${HOME}/.codex/config.toml"
 compose_env_path="${repo_root}/.env"
 client_key_path="${state_root}/client-key"
 codex_client_version_path="${state_root}/codex-client-version"
+worker_pid_path="${state_root}/host-worker.pid"
 profile_pattern='^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
 skip_codex_config=0
 no_start=0
@@ -198,6 +199,72 @@ start_router() {
   fail 'Container started, but the local health check did not become ready. Run: docker compose logs --tail=100 gpt-codex-router'
 }
 
+host_worker_artifact() {
+  local arch
+  arch="$(uname -m)"
+  case "$arch" in
+    arm64|aarch64) printf '%s\n' 'gpt-codex-router-darwin-arm64' ;;
+    x86_64|amd64) printf '%s\n' 'gpt-codex-router-darwin-amd64' ;;
+    *) fail "Unsupported macOS architecture for host worker: $arch" ;;
+  esac
+}
+
+host_router_binary() {
+  printf '%s\n' "${state_root}/host-tools/$(host_worker_artifact)"
+}
+
+stop_host_worker() {
+  [ -f "$worker_pid_path" ] || return 0
+  local pid
+  pid="$(tr -dc '0-9' < "$worker_pid_path")"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    local command
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    case "$command" in
+      *GPTCodexRouter/host-tools/gpt-codex-router-darwin-*' worker'*) kill "$pid" 2>/dev/null || true ;;
+    esac
+  fi
+  rm -f "$worker_pid_path"
+}
+
+install_host_worker_binary() {
+  local artifact binary
+  artifact="$(host_worker_artifact)"
+  binary="$(host_router_binary)"
+  mkdir -p "$(dirname "$binary")"
+  stop_host_worker
+  rm -f "$binary"
+  (
+    cd "$repo_root"
+    docker compose cp "gpt-codex-router:/opt/gpt-codex-router/host-workers/${artifact}" "$binary"
+  ) || fail 'Could not extract the macOS host worker from the built Docker image.'
+  chmod 700 "$binary"
+}
+
+start_host_worker() {
+  local binary
+  binary="$(host_router_binary)"
+  [ -x "$binary" ] || fail "Host worker binary is missing or not executable: $binary."
+
+  GPT_CODEX_ROUTER_HOME="$state_root" \
+    nohup "$binary" worker --server http://127.0.0.1:8317 \
+      </dev/null >/dev/null 2>&1 &
+  local pid=$!
+  printf '%s\n' "$pid" > "$worker_pid_path"
+  chmod 600 "$worker_pid_path"
+
+  sleep 0.5
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$worker_pid_path"
+    fail 'Host login worker exited during startup.'
+  fi
+}
+
+print_admin_access() {
+  printf 'Account management UI: http://127.0.0.1:8317/admin\n'
+  printf 'Administrator key command: docker compose exec -T gpt-codex-router gpt-codex-router admin-key\n'
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --profiles)
@@ -236,6 +303,7 @@ chmod 700 "$state_root"
 write_codex_client_version
 client_api_key="$(ensure_client_api_key)"
 write_compose_env
+stop_host_worker
 stop_existing_router
 read_existing_registry
 
@@ -286,7 +354,10 @@ if [ "$no_start" -eq 0 ]; then
   if [ "$skip_codex_config" -eq 0 ]; then
     set_codex_desktop_config
   fi
+  install_host_worker_binary
+  start_host_worker
   printf '\nGPT Codex Router is running at http://127.0.0.1:8317\n'
+  print_admin_access
   printf 'OpenAI-compatible base URL: http://127.0.0.1:8317/v1\n'
   printf 'Local API key file: %s\n' "$client_key_path"
   if [ "$skip_codex_config" -eq 0 ]; then

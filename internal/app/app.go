@@ -14,6 +14,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/munlucky/codex-account-pool/internal/adminapi"
+	"github.com/munlucky/codex-account-pool/internal/adminauth"
+	"github.com/munlucky/codex-account-pool/internal/adminworker"
 	"github.com/munlucky/codex-account-pool/internal/antigravity"
 	"github.com/munlucky/codex-account-pool/internal/antigravityauth"
 	"github.com/munlucky/codex-account-pool/internal/authbroker"
@@ -74,6 +77,10 @@ func (a *App) Execute(ctx context.Context, args []string) error {
 		return a.executeServe(ctx, args[1:])
 	case "api-key":
 		return a.executeAPIKey(args[1:])
+	case "admin-key":
+		return a.executeAdminKey(args[1:])
+	case "worker":
+		return a.executeWorker(ctx, args[1:])
 	case "report":
 		return a.executeReport(args[1:])
 	case "help", "--help", "-h":
@@ -331,6 +338,51 @@ func (a *App) executeAPIKey(args []string) error {
 	return nil
 }
 
+func (a *App) executeAdminKey(args []string) error {
+	if len(args) != 0 {
+		return fmt.Errorf("%w: usage: admin-key", ErrUsage)
+	}
+	key, err := adminauth.EnsureAdminKey(a.Store.Root())
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(a.Out, key)
+	return nil
+}
+
+func (a *App) executeWorker(ctx context.Context, args []string) error {
+	serverURL := "http://127.0.0.1:8317"
+	once := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--server":
+			if i+1 >= len(args) {
+				return fmt.Errorf("%w: --server requires a value", ErrUsage)
+			}
+			serverURL = args[i+1]
+			i++
+		case "--once":
+			once = true
+		default:
+			return fmt.Errorf("%w: usage: worker [--server http://127.0.0.1:8317] [--once]", ErrUsage)
+		}
+	}
+	workerKey, err := adminauth.EnsureWorkerKey(a.Store.Root())
+	if err != nil {
+		return err
+	}
+	worker := &adminworker.Worker{
+		ServerURL: serverURL,
+		WorkerKey: workerKey,
+		Store:     a.Store,
+		Executor:  a.Executor,
+		CodexBin:  a.CodexBin,
+		Out:       a.Out,
+		Err:       a.Err,
+	}
+	return worker.Run(ctx, once)
+}
+
 func (a *App) executeServe(ctx context.Context, args []string) error {
 	listen, err := parseServeArgs(args)
 	if err != nil {
@@ -382,10 +434,28 @@ func (a *App) executeServe(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	adminKey, err := adminauth.EnsureAdminKey(a.Store.Root())
+	if err != nil {
+		return fmt.Errorf("initialize administrator authentication: %w", err)
+	}
+	workerKey, err := adminauth.EnsureWorkerKey(a.Store.Root())
+	if err != nil {
+		return fmt.Errorf("initialize host worker authentication: %w", err)
+	}
+	adminState, err := adminapi.OpenStateStore(a.Store.Root())
+	if err != nil {
+		return fmt.Errorf("initialize administrator state: %w", err)
+	}
+	checker := &adminapi.CodexChecker{
+		Broker: broker, Gateway: handler, ClientVersion: clientVersion,
+	}
+	adminService := adminapi.NewService(a.Store, broker, adminState, checker)
+	adminHandler := adminapi.NewHandler(adminService, adminauth.NewSessions(adminKey), workerKey)
+
 	logger.Emit(observability.Event{EventType: observability.EventStartup})
 	server := &http.Server{
 		Addr:              listen,
-		Handler:           serverHandler(handler, openAIHandler),
+		Handler:           serverHandler(handler, openAIHandler, adminHandler),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -439,12 +509,20 @@ func requireSafeListenAddress(address string) error {
 	return fmt.Errorf("refusing non-loopback listen address %q; use loopback, or container mode with an unspecified container address behind a host loopback port mapping", address)
 }
 
-func serverHandler(backend, openAI http.Handler) http.Handler {
+func serverHandler(backend, openAI http.Handler, admin ...http.Handler) http.Handler {
+	var adminHandler http.Handler
+	if len(admin) > 0 {
+		adminHandler = admin[0]
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, "ok\n")
+			return
+		}
+		if adminHandler != nil && (r.URL.Path == "/admin" || strings.HasPrefix(r.URL.Path, "/admin/")) {
+			adminHandler.ServeHTTP(w, r)
 			return
 		}
 		if r.URL.Path == "/v1" || strings.HasPrefix(r.URL.Path, "/v1/") {
@@ -513,6 +591,8 @@ Usage:
   gpt-codex-router auth status <codex|google-antigravity> [profile]
   gpt-codex-router serve [--listen 127.0.0.1:8317]
   gpt-codex-router api-key
+  gpt-codex-router admin-key
+  gpt-codex-router worker [--server http://127.0.0.1:8317] [--once]
   gpt-codex-router report [--since 3h] [--timezone Asia/Seoul] [--file <jsonl>|--stdin]
   gpt-codex-router run codex [--profile <id>] [-- <client args...>]
   gpt-codex-router version

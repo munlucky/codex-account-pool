@@ -37,9 +37,16 @@ type failoverCredentialProvider interface {
 	Failover(context.Context, string, time.Time) (authbroker.Credentials, error)
 }
 
+type profileCredentialProvider interface {
+	CredentialProvider
+	CredentialsForProfile(context.Context, string) (authbroker.Credentials, error)
+	ForceRefresh(context.Context, string) (authbroker.Credentials, error)
+}
+
 type credentialContextKey struct{}
 type traceContextKey struct{}
 type apiSurfaceContextKey struct{}
+type pinnedProfileContextKey struct{}
 
 type RequestEvent = observability.Event
 type RequestLogger func(RequestEvent)
@@ -187,6 +194,16 @@ func apiSurfaceFromRequest(r *http.Request) string {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.serveHTTP(w, r, "")
+}
+
+// ServeHTTPForProfile routes one internal request with an explicitly selected
+// registered Codex profile. It never changes the active profile.
+func (h *Handler) ServeHTTPForProfile(w http.ResponseWriter, r *http.Request, profileID string) {
+	h.serveHTTP(w, r, strings.TrimSpace(profileID))
+}
+
+func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, profileID string) {
 	trace := &requestTrace{
 		id:            newRequestID(),
 		method:        r.Method,
@@ -233,7 +250,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	authStart := time.Now()
-	creds, err := h.provider.Credentials(r.Context())
+	var creds authbroker.Credentials
+	var err error
+	if profileID != "" {
+		provider, ok := h.provider.(profileCredentialProvider)
+		if !ok {
+			err = errors.New("profile-specific credential lookup is unavailable")
+		} else {
+			creds, err = provider.CredentialsForProfile(r.Context(), profileID)
+		}
+	} else {
+		creds, err = h.provider.Credentials(r.Context())
+	}
 	trace.setAuth(time.Since(authStart), h.profileRef(creds.ProfileID))
 	if err != nil {
 		trace.setStatus(http.StatusBadGateway, "local")
@@ -241,7 +269,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(iw, "GPT Codex Router authentication unavailable", http.StatusBadGateway)
 		return
 	}
-	ctx = context.WithValue(r.Context(), credentialContextKey{}, creds)
+	ctx = r.Context()
+	if profileID != "" {
+		ctx = context.WithValue(ctx, pinnedProfileContextKey{}, true)
+	}
+	ctx = context.WithValue(ctx, credentialContextKey{}, creds)
 	h.proxy.ServeHTTP(iw, r.Clone(ctx))
 }
 
@@ -339,6 +371,7 @@ func (t *quotaFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 	}
 
 	current := req
+	authRefreshed := map[string]bool{}
 	for {
 		attempt := 1
 		if trace := traceFromRequest(current); trace != nil {
@@ -358,6 +391,23 @@ func (t *quotaFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 			return nil, err
 		}
 		resp.Request = current
+		if resp.StatusCode == http.StatusUnauthorized && safeAuthRetry(current) {
+			provider, ok := t.provider.(profileCredentialProvider)
+			currentCreds, hasCreds := requestCredentials(current)
+			if ok && hasCreds && currentCreds.ProfileID != "" && !authRefreshed[currentCreds.ProfileID] {
+				refreshed, refreshErr := provider.ForceRefresh(current.Context(), currentCreds.ProfileID)
+				authRefreshed[currentCreds.ProfileID] = true
+				if refreshErr == nil {
+					_ = resp.Body.Close()
+					current = cloneForRetry(current, body, refreshed)
+					continue
+				}
+				if authbroker.Code(refreshErr) != authbroker.ErrorNotLoggedIn && authbroker.Code(refreshErr) != authbroker.ErrorReauthRequired {
+					_ = resp.Body.Close()
+					return nil, fmt.Errorf("same-profile credential refresh unavailable: %w", refreshErr)
+				}
+			}
+		}
 		limited, resetAt, limitErr := usageLimitResponse(resp)
 		if limitErr != nil || !limited {
 			if limitErr != nil {
@@ -366,6 +416,9 @@ func (t *quotaFailoverTransport) RoundTrip(req *http.Request) (*http.Response, e
 				}
 			}
 			return resp, limitErr
+		}
+		if pinnedProfile(current) {
+			return resp, nil
 		}
 		provider, ok := t.provider.(failoverCredentialProvider)
 		currentCreds, hasCreds := requestCredentials(current)
@@ -881,6 +934,28 @@ func (o *sseObserver) Outcome() string {
 		return observability.SemanticUnobserved
 	}
 	return o.outcome
+}
+
+func pinnedProfile(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	pinned, _ := req.Context().Value(pinnedProfileContextKey{}).(bool)
+	return pinned
+}
+
+func safeAuthRetry(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	case http.MethodPost:
+		return req.URL != nil && req.URL.Path == "/backend-api/codex/responses"
+	default:
+		return false
+	}
 }
 
 func makeReplayable(req *http.Request) ([]byte, error) {
