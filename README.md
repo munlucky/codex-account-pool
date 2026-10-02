@@ -207,7 +207,7 @@ Bare `gemini-*` IDs are **not** inferred as Antigravity. The explicit prefix pre
 
 `/v1/responses` is the primary compatibility path. For Codex models, the existing compatibility rules remain unchanged: string input becomes response items, `store:false` and upstream `stream:true` are enforced, Qwen-style `max_output_tokens` is removed because the subscription backend rejects it, non-stream callers receive reconstructed completed JSON, and successful stream callers receive normalized SSE headers. For `google-antigravity/*`, the adapter translates Responses messages, instructions, function tools, tool calls/results, reasoning controls, streaming output, token usage, and provider thought signatures into and out of Cloud Code Assist while still exposing canonical Responses SSE locally. Explicit `store:true` is rejected locally.
 
-`/v1/chat/completions` first translates the supported Chat Completions subset to the same canonical Responses request and then uses the same provider router, so Antigravity does not have a separate Chat-only transport.
+`/v1/chat/completions` first translates the supported Chat Completions subset to the same canonical Responses request and then uses the same provider router. For Codex-backed Qwen clients, legacy Chat `system` messages are normalized to Responses `developer` messages, and text-part tool-result arrays are folded into `function_call_output` text. Antigravity does not have a separate Chat-only transport.
 
 `/v1/models` merges the Codex model catalog with a lazily discovered Antigravity catalog. Antigravity discovery has a bounded timeout and in-memory cache; startup never waits on it, and a bounded static catalog is used when live discovery is unavailable. Antigravity IDs are exposed only as `google-antigravity/<model>`.
 
@@ -238,7 +238,7 @@ Antigravity conversations keep their selected account across turns and verified 
 
 For credentialed end-to-end verification, including manual Docker callback completion, Responses streaming, two-turn function-call/signature replay, and Qwen Code, see [`docs/google-antigravity-live-test.md`](docs/google-antigravity-live-test.md).
 
-Qwen Code's `openai-responses` provider is a tested Codex client path and uses the same local `/v1` surface for Antigravity model selection. For the one-file `~/.qwen/settings.json` configuration, router-specific key naming, model selection, and troubleshooting, see [`docs/qwen-code.md`](docs/qwen-code.md). For the exact endpoint/normalization contract, see [`docs/openai-compatible-api.md`](docs/openai-compatible-api.md).
+Qwen Code is tested against both supported local compatibility paths: Qwen Code 0.21.15 through its built-in `openai` Chat Completions protocol, including a real `read_file` tool round trip, and Qwen Code 0.23.3 through the Responses path. For version-specific `~/.qwen/settings.json` configuration, router-specific key naming, model selection, and troubleshooting, see [`docs/qwen-code.md`](docs/qwen-code.md). For the exact endpoint/normalization contract, see [`docs/openai-compatible-api.md`](docs/openai-compatible-api.md).
 
 ## Codex compatibility
 

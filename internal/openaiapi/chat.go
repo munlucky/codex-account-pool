@@ -155,7 +155,14 @@ func translateChatRequest(req chatRequest) ([]byte, error) {
 				return nil, err
 			}
 			if content != nil {
-				input = append(input, map[string]any{"type": "message", "role": msg.Role, "content": content})
+				role := msg.Role
+				// The ChatGPT Codex Responses backend rejects input messages with the
+				// legacy Chat Completions system role. Treat system instructions as
+				// developer messages while preserving their conversation position.
+				if role == "system" {
+					role = "developer"
+				}
+				input = append(input, map[string]any{"type": "message", "role": role, "content": content})
 			}
 		}
 		if msg.Role == "assistant" {
@@ -284,7 +291,22 @@ func messageContentText(raw json.RawMessage) (string, error) {
 	if json.Unmarshal(raw, &text) == nil {
 		return text, nil
 	}
-	return "", fmt.Errorf("tool message content must be text")
+	var parts []map[string]any
+	if json.Unmarshal(raw, &parts) != nil {
+		return "", fmt.Errorf("tool message content must be text or a text content array")
+	}
+	var out strings.Builder
+	for _, part := range parts {
+		if part["type"] != "text" {
+			return "", fmt.Errorf("tool message content array supports only text parts")
+		}
+		value, ok := part["text"].(string)
+		if !ok {
+			return "", fmt.Errorf("tool message text content must be a string")
+		}
+		out.WriteString(value)
+	}
+	return out.String(), nil
 }
 
 func translateToolChoice(raw json.RawMessage) (any, error) {

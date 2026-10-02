@@ -339,6 +339,75 @@ func TestChatCompletionTranslatesRequestAndResponse(t *testing.T) {
 	}
 }
 
+func TestChatCompletionMapsSystemRoleToDeveloperForCodex(t *testing.T) {
+	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		input, _ := payload["input"].([]any)
+		if len(input) != 2 {
+			t.Fatalf("input=%s", body)
+		}
+		first, _ := input[0].(map[string]any)
+		second, _ := input[1].(map[string]any)
+		if first["role"] != "developer" || second["role"] != "user" {
+			t.Fatalf("roles=%v,%v body=%s", first["role"], second["role"], body)
+		}
+		if strings.Contains(string(body), `"role":"system"`) {
+			t.Fatalf("system role leaked to Codex backend: %s", body)
+		}
+		if _, exists := payload["max_output_tokens"]; exists {
+			t.Fatalf("max_output_tokens leaked to Codex backend: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_qwen\",\"model\":\"gpt-test\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+	})
+	h, _ := New(backend, testKey, testClientVersion)
+	body := `{"model":"gpt-test","messages":[{"role":"system","content":"You are Qwen Code."},{"role":"user","content":[{"type":"text","text":"Reply with exactly: pong"}]}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}],"max_tokens":64000,"stream":true,"stream_options":{"include_usage":true}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestChatCompletionAcceptsQwenToolTextContentArray(t *testing.T) {
+	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		input, _ := payload["input"].([]any)
+		if len(input) != 4 {
+			t.Fatalf("input=%s", body)
+		}
+		call, _ := input[2].(map[string]any)
+		result, _ := input[3].(map[string]any)
+		if call["type"] != "function_call" || call["call_id"] != "call_read" || call["name"] != "read_file" {
+			t.Fatalf("function call=%v", call)
+		}
+		if result["type"] != "function_call_output" || result["call_id"] != "call_read" || result["output"] != "module example.test\n\ngo 1.23\n" {
+			t.Fatalf("function result=%v", result)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_qwen_tool\",\"model\":\"gpt-test\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+	})
+	h, _ := New(backend, testKey, testClientVersion)
+	body := `{"model":"gpt-test","messages":[{"role":"system","content":"You are Qwen Code."},{"role":"user","content":"Read go.mod"},{"role":"assistant","content":null,"tool_calls":[{"id":"call_read","type":"function","function":{"name":"read_file","arguments":"{\"file_path\":\"go.mod\"}"}}]},{"role":"tool","tool_call_id":"call_read","content":[{"type":"text","text":"module example.test\n\ngo 1.23\n"}]}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestChatCompletionStreamingTranslatesTextAndDone(t *testing.T) {
 	backend := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

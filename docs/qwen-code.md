@@ -25,20 +25,28 @@ or invent replacement signatures to bypass a missing original.
 
 Clients may supply a unique `X-Client-Thread-Id` per conversation to retain account affinity across plain-text turns as well. Do not hardcode one shared ID for concurrent sessions. The local regression suite covers headerless Responses tool continuation, Chat translation, account changes, and signature restoration with a fake upstream; it is not a fresh credentialed Qwen/Google live test.
 
-Qwen Code can use GPT Codex Router through its `openai-responses` provider.
+Qwen Code can use GPT Codex Router through either of the local OpenAI-compatible surfaces supported by the installed Qwen version.
 
-This path has been validated against the router with Qwen Code 0.23.3 on Windows using a ChatGPT/Codex profile and `gpt-5.6-luna`.
+- Qwen Code 0.21.15 uses the built-in `openai` protocol and sends `/v1/chat/completions`. This path was live-verified with a ChatGPT/Codex profile and `gpt-5.6-luna` for both text generation and a real `read_file` tool round trip.
+- Qwen Code 0.23.3 has also been validated through the `openai-responses` path against `/v1/responses`.
 
 ```text
-Qwen Code
+Qwen Code 0.21.15
+  -> openai
+  -> http://127.0.0.1:8317/v1/chat/completions
+  -> Chat-to-Responses compatibility adapter
+  -> selected ChatGPT/Codex profile
+  -> chatgpt.com/backend-api/codex/responses
+
+Responses-capable Qwen
   -> openai-responses
   -> http://127.0.0.1:8317/v1/responses
-  -> GPT Codex Router compatibility adapter
+  -> Responses compatibility adapter
   -> selected ChatGPT/Codex profile
   -> chatgpt.com/backend-api/codex/responses
 ```
 
-Use `openai-responses`, not the legacy `openai` Chat Completions provider, when possible. It maps directly to the router's primary `/v1/responses` compatibility path and preserves Responses tool/reasoning semantics more accurately.
+Prefer `/v1/responses` when the installed Qwen release exposes an `openai-responses` provider. For Qwen Code 0.21.15, use its native `openai` provider; the router normalizes the Chat request into the same Codex Responses backend contract.
 
 ## Prerequisites
 
@@ -94,7 +102,7 @@ Example:
     "GPT_CODEX_ROUTER_API_KEY": "gcr_REPLACE_WITH_CURRENT_ROUTER_KEY"
   },
   "modelProviders": {
-    "openai-responses": [
+    "openai": [
       {
         "id": "gpt-5.6-luna",
         "name": "GPT-5.6 Luna (Codex Account Pool)",
@@ -108,7 +116,7 @@ Example:
   },
   "security": {
     "auth": {
-      "selectedType": "openai-responses"
+      "selectedType": "openai"
     }
   },
   "model": {
@@ -124,7 +132,7 @@ cd C:\dev\ai-auth-proxy
 docker compose exec -T gpt-codex-router gpt-codex-router api-key
 ```
 
-Do not put `/responses` in `baseUrl`. Qwen appends the Responses route itself, so the correct value is:
+Do not put `/responses` or `/chat/completions` in `baseUrl`. Qwen appends the route required by its selected protocol, so the correct value is:
 
 ```text
 http://127.0.0.1:8317/v1
@@ -140,7 +148,7 @@ Using a router-specific name isolates this configuration:
 settings.json env.GPT_CODEX_ROUTER_API_KEY
                     |
                     v
-modelProviders.openai-responses[].envKey
+modelProviders.openai[].envKey
                     |
                     v
 Authorization: Bearer <router client-key>
@@ -160,7 +168,7 @@ curl.exe http://127.0.0.1:8317/v1/models `
   -H "Authorization: Bearer $key"
 ```
 
-Add another entry to `modelProviders.openai-responses`, for example:
+Add another entry to the same `modelProviders.openai` array, for example:
 
 ```json
 {
@@ -199,12 +207,14 @@ After the smoke test succeeds, normal Qwen skills/workflows use the same provide
 
 ## Why the router normalizes Qwen requests
 
-Qwen's `openai-responses` provider follows the public OpenAI Responses shape, while the ChatGPT Codex subscription backend has a narrower request contract.
+Qwen can reach the router through either Chat Completions or Responses, while the ChatGPT Codex subscription backend ultimately expects a narrower Responses contract.
 
 The router currently handles the known differences required by Qwen:
 
-- Qwen can send `max_output_tokens`; the router removes it because the Codex subscription backend rejects it;
-- Qwen expects streaming Responses; the router always requests upstream streaming;
+- Qwen Code 0.21.15 Chat `system` messages are mapped to Responses `developer` messages because the Codex backend rejects the legacy `system` input role;
+- Qwen Code 0.21.15 tool results may arrive as a text-content array; the router folds those text parts into the `function_call_output` string expected by Responses;
+- Qwen can send `max_tokens` or `max_output_tokens`; the Chat adapter translates token limits and the Codex backend removes `max_output_tokens` because the subscription route rejects it;
+- Qwen streaming is preserved while the Codex backend is always called with upstream `stream:true`;
 - successful local streaming responses are labeled `Content-Type: text/event-stream`, even when the backend omitted that header;
 - the Codex backend requires `store:false`;
 - OpenAI string input can be converted into the Codex item-list form;
