@@ -96,7 +96,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.Stream {
 		sw := newChatStreamWriter(w, req.Model, req.StreamOptions != nil && req.StreamOptions.IncludeUsage)
 		backend.ServeResponses(sw, clone, target.Model)
-		sw.finish()
+		if clone.Context().Err() != nil {
+			return
+		}
+		if err := sw.finish(); err != nil {
+			return
+		}
 		return
 	}
 	capture := newCaptureWriter()
@@ -476,6 +481,7 @@ type chatStreamWriter struct {
 	toolSeen     bool
 	callIndexes  map[string]int
 	nextIndex    int
+	terminalErr  error
 }
 
 func newChatStreamWriter(dst http.ResponseWriter, model string, includeUsage bool) *chatStreamWriter {
@@ -498,6 +504,9 @@ func (w *chatStreamWriter) WriteHeader(code int) {
 	w.dst.WriteHeader(code)
 }
 func (w *chatStreamWriter) Write(p []byte) (int, error) {
+	if w.terminalErr != nil {
+		return 0, w.terminalErr
+	}
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
@@ -517,7 +526,9 @@ func (w *chatStreamWriter) Write(p []byte) (int, error) {
 		}
 		frame := append([]byte(nil), w.buf[:idx]...)
 		w.buf = w.buf[idx+sep:]
-		w.consumeFrame(frame)
+		if err := w.consumeFrame(frame); err != nil {
+			return len(p), err
+		}
 	}
 	return len(p), nil
 }
@@ -526,15 +537,21 @@ func (w *chatStreamWriter) Flush() {
 		f.Flush()
 	}
 }
-func (w *chatStreamWriter) finish() {
+func (w *chatStreamWriter) finish() error {
+	if w.terminalErr != nil {
+		return w.terminalErr
+	}
 	if w.status < 400 && !w.done && len(bytes.TrimSpace(w.buf)) > 0 {
-		w.consumeFrame(w.buf)
+		if err := w.consumeFrame(w.buf); err != nil {
+			return err
+		}
 	}
 	if w.status < 400 && !w.done {
-		w.emitFinal(nil)
+		return w.emitFinal(nil)
 	}
+	return nil
 }
-func (w *chatStreamWriter) consumeFrame(frame []byte) {
+func (w *chatStreamWriter) consumeFrame(frame []byte) error {
 	var data []byte
 	for _, line := range bytes.Split(frame, []byte("\n")) {
 		line = bytes.TrimSpace(line)
@@ -544,19 +561,19 @@ func (w *chatStreamWriter) consumeFrame(frame []byte) {
 		}
 	}
 	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
-		return
+		return nil
 	}
 	var ev map[string]any
 	if json.Unmarshal(data, &ev) != nil {
-		return
+		return nil
 	}
 	typ, _ := ev["type"].(string)
 	switch typ {
 	case "response.created":
-		w.emitDelta(map[string]any{"role": "assistant"}, nil)
+		return w.emitDelta(map[string]any{"role": "assistant"}, nil)
 	case "response.output_text.delta":
 		if d, ok := ev["delta"].(string); ok {
-			w.emitDelta(map[string]any{"content": d}, nil)
+			return w.emitDelta(map[string]any{"content": d}, nil)
 		}
 	case "response.output_item.added":
 		if item, ok := ev["item"].(map[string]any); ok && item["type"] == "function_call" {
@@ -570,7 +587,7 @@ func (w *chatStreamWriter) consumeFrame(frame []byte) {
 			w.toolSeen = true
 			name, _ := item["name"].(string)
 			callID, _ := item["call_id"].(string)
-			w.emitDelta(map[string]any{"tool_calls": []any{map[string]any{"index": idx, "id": callID, "type": "function", "function": map[string]any{"name": name, "arguments": ""}}}}, nil)
+			return w.emitDelta(map[string]any{"tool_calls": []any{map[string]any{"index": idx, "id": callID, "type": "function", "function": map[string]any{"name": name, "arguments": ""}}}}, nil)
 		}
 	case "response.function_call_arguments.delta":
 		id, _ := ev["item_id"].(string)
@@ -584,7 +601,7 @@ func (w *chatStreamWriter) consumeFrame(frame []byte) {
 		}
 		d, _ := ev["delta"].(string)
 		w.toolSeen = true
-		w.emitDelta(map[string]any{"tool_calls": []any{map[string]any{"index": idx, "function": map[string]any{"arguments": d}}}}, nil)
+		return w.emitDelta(map[string]any{"tool_calls": []any{map[string]any{"index": idx, "function": map[string]any{"arguments": d}}}}, nil)
 	case "response.completed":
 		var usage map[string]any
 		if r, ok := ev["response"].(map[string]any); ok {
@@ -592,22 +609,29 @@ func (w *chatStreamWriter) consumeFrame(frame []byte) {
 				usage = chatUsage(u)
 			}
 		}
-		w.emitFinal(usage)
+		return w.emitFinal(usage)
 	case "response.failed", "response.incomplete":
-		w.emitFinal(nil)
+		return w.emitFinal(nil)
 	}
+	return nil
 }
-func (w *chatStreamWriter) emitDelta(delta map[string]any, finish any) {
+func (w *chatStreamWriter) emitDelta(delta map[string]any, finish any) error {
 	if w.done {
-		return
+		return nil
+	}
+	if w.terminalErr != nil {
+		return w.terminalErr
 	}
 	w.started = true
 	chunk := map[string]any{"id": "chatcmpl-stream", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": w.model, "choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}}}
-	w.emit(chunk)
+	return w.emit(chunk)
 }
-func (w *chatStreamWriter) emitFinal(usage map[string]any) {
+func (w *chatStreamWriter) emitFinal(usage map[string]any) error {
 	if w.done {
-		return
+		return nil
+	}
+	if w.terminalErr != nil {
+		return w.terminalErr
 	}
 	finish := "stop"
 	if w.toolSeen {
@@ -617,15 +641,45 @@ func (w *chatStreamWriter) emitFinal(usage map[string]any) {
 	if w.includeUsage && usage != nil {
 		chunk["usage"] = usage
 	}
-	w.emit(chunk)
-	_, _ = io.WriteString(w.dst, "data: [DONE]\n\n")
-	w.Flush()
+	if err := w.emit(chunk); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w.dst, "data: [DONE]\n\n"); err != nil {
+		return w.fail(err)
+	}
+	if err := w.flushDownstream(); err != nil {
+		return w.fail(err)
+	}
 	w.done = true
+	return nil
 }
-func (w *chatStreamWriter) emit(value any) {
-	b, _ := json.Marshal(value)
-	_, _ = fmt.Fprintf(w.dst, "data: %s\n\n", b)
-	w.Flush()
+func (w *chatStreamWriter) emit(value any) error {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return w.fail(err)
+	}
+	if _, err := fmt.Fprintf(w.dst, "data: %s\n\n", b); err != nil {
+		return w.fail(err)
+	}
+	if err := w.flushDownstream(); err != nil {
+		return w.fail(err)
+	}
+	return nil
+}
+func (w *chatStreamWriter) flushDownstream() error {
+	if f, ok := w.dst.(interface{ FlushError() error }); ok {
+		return f.FlushError()
+	}
+	if f, ok := w.dst.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
+}
+func (w *chatStreamWriter) fail(err error) error {
+	if err != nil && w.terminalErr == nil {
+		w.terminalErr = err
+	}
+	return err
 }
 func copyHeader(dst, src http.Header) {
 	for k, values := range src {
